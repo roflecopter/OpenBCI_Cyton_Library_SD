@@ -3391,7 +3391,7 @@ void OpenBCI_32bit_Library::updateChannelData(void)
     auxData[2] = wifi.present ? 0 : digitalRead(18);
     break;
   case BOARD_MODE_MARKER:
-    if (curMarkerStatus == REC_MARKER_STATUS_RECEIVED){
+    if (curMarkerStatus == REC_MARKER_STATUS_RECEIVED)
     {
       auxData[0] = (short)markerValue;
       curMarkerStatus = REC_MARKER_STATUS_NONE;
