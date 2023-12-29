@@ -46,6 +46,8 @@ void loop() {
         // Write to the SD card, writes aux data
         writeDataToSDcard(board.sampleCounter);
       }
+      // this is required for the board to be aware of active SD card writes
+      board.sdFileOpen = SDfileOpen;
 
       board.sendChannelData();
     }
