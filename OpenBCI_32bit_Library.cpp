@@ -1987,7 +1987,7 @@ void OpenBCI_32bit_Library::driveLed(void){
         ledState = ON;
       else
         ledState = OFF;
-      nextLedEvent =  millis() + 50;
+      nextLedEvent =  millis() + 5000;
     } else {
       if (ledOnOff)
         ledState = ON;
