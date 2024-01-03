@@ -191,7 +191,8 @@ boolean setupSDcard(char limit){
       return fileIsOpen;
   }
 
-  BLOCK_COUNT = ceil(BLOCK_COUNT / 250 * board.getSampleRate().toInt());
+  String boardFreq = board.getSampleRate();
+  BLOCK_COUNT = ceil(BLOCK_COUNT / 250 * boardFreq.toInt());
 
   incrementFileCounter();
   openvol = root.openRoot(volume);
