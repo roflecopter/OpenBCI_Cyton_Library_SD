@@ -1,7 +1,15 @@
-[![Stories in Ready](https://badge.waffle.io/OpenBCI/OpenBCI_32bit_Library.png?label=ready&title=Ready)](https://waffle.io/OpenBCI/OpenBCI_32bit_Library)
-# OpenBCI 32bit Library
+# OpenBCI 32bit Library with SD improvements
 
-The official library for the OpenBCI 32bit Board.
+This is a modified library for the OpenBCI 32bit Board firmware which adds additional SD card functionality. 
+
+Main purpose is to improve experience while using OpenBCI Cyton as a part of home based PSG sleep research. You can read more about my quantified self project and especially OpenBCI experience [here](https://blog.kto.to/hypnodyne-zmax-vs-openbci-eeg-psg) .
+
+* flashing LED during writing (every 5 seconds). [Source](https://github.com/OpenBCI/OpenBCI_Cyton_Library/pull/80)
+* increased sampling rate. [Source](https://github.com/OpenBCI/OpenBCI_Cyton_Library/pull/96)
+* bugfixes. [Source](https://github.com/OpenBCI/OpenBCI_Cyton_Library/pull/93)
+
+TODO:
+* add external trigger to stard sd writing with increased sampling rate
 
 ## Table of Contents:
 
