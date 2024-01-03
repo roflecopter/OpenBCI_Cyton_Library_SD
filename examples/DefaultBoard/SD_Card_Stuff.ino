@@ -191,7 +191,8 @@ boolean setupSDcard(char limit){
       return fileIsOpen;
   }
 
- 
+  BLOCK_COUNT = ceil(BLOCK_COUNT / 250 * board.getSampleRate().toInt());
+
   incrementFileCounter();
   openvol = root.openRoot(volume);
   openfile.remove(root, currentFileName); // if the file is over-writing, let it!
