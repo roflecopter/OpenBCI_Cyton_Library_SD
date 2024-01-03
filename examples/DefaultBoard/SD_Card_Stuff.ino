@@ -249,7 +249,7 @@ boolean setupSDcard(char limit){
   if(fileIsOpen == true){  // send corresponding file name to controlling program
     if(!board.streaming) {
       Serial0.print("Blocks ");
-      Serial0.print(BLOCK_COUNT);
+      Serial0.println(BLOCK_COUNT);
       Serial0.print("Corresponding SD file ");
       Serial0.println(currentFileName);
       LED_SD_Status_Indication(OK_BLINKS, 250, OK_LED);
