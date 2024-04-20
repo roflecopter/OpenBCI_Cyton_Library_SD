@@ -1983,11 +1983,13 @@ void OpenBCI_32bit_Library::driveLed(void){
         nextLedEvent = millis();
       }
     } else if (ledSDWrite) {
-      if (ledState == OFF)
-        ledState = ON;
-      else
-        ledState = OFF;
-      nextLedEvent =  millis() + 5000;
+      if (ledState == OFF) {
+          ledState = ON;
+          nextLedEvent =  millis() + 500;
+        } else {
+          ledState = OFF;
+          nextLedEvent =  millis() + 3000;
+      }
     } else {
       if (ledOnOff)
         ledState = ON;
