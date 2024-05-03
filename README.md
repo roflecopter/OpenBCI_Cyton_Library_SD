@@ -12,8 +12,8 @@ TODO:
 * add external trigger to stard sd writing with increased sampling rate
 
 Instructions:
-* Follow OpenBCI official firmware update instructions
-* The only diffrence is that you use [modded OpenBCI 32bit SD](https://github.com/roflecopter/OpenBCI_Cyton_Library_SD/) instead of default one [OpenBCI_32bit_SD](https://github.com/OpenBCI/OpenBCI_32bit_SD)
+* Follow OpenBCI official firmware upgrade [instructions](https://docs.openbci.com/Cyton/CytonProgram/)
+* The only diffrence is that you clone [modded OpenBCI 32bit SD](https://github.com/roflecopter/OpenBCI_Cyton_Library_SD/) from this repo instead of default [OpenBCI_32bit_SD](https://github.com/OpenBCI/OpenBCI_32bit_SD)
 
 ## Table of Contents:
 
