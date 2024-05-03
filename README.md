@@ -8,7 +8,7 @@ Main purpose is to improve experience while using OpenBCI Cyton as a part of hom
 * increased sampling rate. [Source](https://github.com/OpenBCI/OpenBCI_Cyton_Library/pull/96)
 * bugfixes. [Source](https://github.com/OpenBCI/OpenBCI_Cyton_Library/pull/93)
 * it works for both Cyton and Cyton+Daisy
-* i use it on a daily basis with 3 different Cyton/Cyton+Daisy and it work stable, rarely i'm gettiong empty sd files for unknow reasons (once 50-60 recordings). [Read more](https://openbci.com/forum/index.php?p=/discussion/3775/sd-card-file-is-empty/)
+* i use it on a daily basis with 3 different Cyton/Cyton+Daisy and it work stable, rarely i'm getting empty sd files for unknow reasons (once 50-60 recordings). [Read more](https://openbci.com/forum/index.php?p=/discussion/3775/sd-card-file-is-empty/)
 
 TODO:
 * add external trigger to stard sd writing with increased sampling rate and hardcoded config, without using a dongle at all
