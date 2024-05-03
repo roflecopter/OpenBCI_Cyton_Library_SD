@@ -16,3 +16,8 @@ TODO:
 Instructions:
 * Follow OpenBCI Cyton official firmware upgrade [instructions](https://docs.openbci.com/Cyton/CytonProgram/)
 * The only diffrence is that you clone [modded OpenBCI 32bit Library](https://github.com/roflecopter/OpenBCI_Cyton_Library_SD/) from this repo instead of default [OpenBCI_32bit_Library](https://github.com/OpenBCI/OpenBCI_32bit_Library)
+
+Importan notice: 
+* You do flashing on your own risk
+* If something goes wrong you can potentially flash stock firmware back if hardware is not faulty.
+* I dont take any responsibility for potential damage, firmware provided as is.
