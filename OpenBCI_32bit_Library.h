@@ -243,6 +243,7 @@ public:
   boolean ledState;
   boolean ledMarkerFound;
   boolean ledSDWrite;
+  boolean ledSDError;
   boolean ledOnOff;
   boolean sdFileOpen;
   boolean streaming;

@@ -58,11 +58,14 @@ void loop() {
     // Read one char from the serial 0 port
     char newChar = board.getCharSerial0();
 
-    // Send to the sd library for processing
-    sdProcessChar(newChar);
+    // 'M' meta-line protocol intercepts the byte stream; skip normal dispatch when consumed
+    if (!sdMetaProcess(newChar)) {
+      // Send to the sd library for processing
+      sdProcessChar(newChar);
 
-    // Send to the board library
-    board.processChar(newChar);
+      // Send to the board library
+      board.processChar(newChar);
+    }
   }
 
   if (board.hasDataSerial1()) {

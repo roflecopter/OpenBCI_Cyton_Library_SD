@@ -28,7 +28,8 @@ int byteCounter = 0;    // used to hold position in cache
 boolean openvol;
 boolean cardInit = false;
 boolean fileIsOpen = false;
-uint8_t BLOCK_DIV = 1; // DEFAULT VALUE
+uint8_t BLOCK_DIV = 1;          // DEFAULT VALUE
+boolean sdBlockDivManual = false; // true if host sent explicit 'c'/'C' override
 
 struct {
   uint32_t block;   // holds block number that over-ran
@@ -36,6 +37,16 @@ struct {
 } over[OVER_DIM];
 
 uint32_t overruns;      // count the number of overruns
+uint32_t sdErrs = 0;    // failed card.writeData() calls (SD multi-block hiccups)
+uint32_t sdRetries = 0; // writeStop+writeStart recovery attempts issued
+uint8_t  sdMetaState = 0;   // 0=idle, 1=need-len-lo, 2=need-len-hi, 3=copying payload, 4=draining bad len
+uint16_t sdMetaCount = 0;   // bytes remaining (state 3) or accumulated len (state 2)
+uint16_t sdMetaLen   = 0;   // parsed length saved at state 2→3 (echoed back on completion)
+uint16_t sdMetaSum   = 0;   // running 16-bit sum of payload bytes (echoed back on completion)
+uint32_t sdMetaStart = 0;   // millis() when 'M' arrived (1 s timeout safety)
+uint8_t  sdPendingErrs = 0; // %E markers to emit AFTER META write completes (keeps the META line atomic)
+boolean  sdMetaCorrupted = false; // set when an UNRECOVERABLE writeCache fails during META state-3 only;
+                                  // pad-flush failures are caught separately via sdErrs delta at ACK time
 uint32_t maxWriteTime;  // keep track of longest write time
 uint32_t minWriteTime;  // and shortest write time
 uint32_t t;        // used to measure total file write time
@@ -50,6 +61,8 @@ prog_char elapsedTime[] PROGMEM = {"%Total time mS:\n"};  // 17
 prog_char minTime[] PROGMEM = {  "%min Write time uS:\n"};  // 20
 prog_char maxTime[] PROGMEM = {  "%max Write time uS:\n"};  // 20
 prog_char overNum[] PROGMEM = {  "%Over:\n"};               //  7
+prog_char errStamp[] PROGMEM = { "%Errors:\n"};             //  9
+prog_char retryStamp[] PROGMEM = { "%Retries:\n"};          // 10
 prog_char blockTime[] PROGMEM = {  "%block, uS\n"};         // 11    74 chars + 2 32(16) + 2 16(8) = 98 + (n 32x2) up to 24 overruns...
 prog_char stopStamp[] PROGMEM = {  "%STOP AT\n"};      // used to stamp SD record when stopped by PC
 prog_char startStamp[] PROGMEM = {  "%START AT\n"};    // used to stamp SD record when started by PC
@@ -118,11 +131,13 @@ char sdProcessChar(char character) {
         case 'c':
         	   // Consider 8-Channels - Single Cyton Board
             BLOCK_DIV = 2;
+            sdBlockDivManual = true;
             break;
-            
-         case 'C': 
+
+         case 'C':
             // Consider 16-Channels - Daisy attached on Cyton Board
             BLOCK_DIV = 1;
+            sdBlockDivManual = true;
             break;
             
         default:
@@ -161,6 +176,11 @@ boolean setupSDcard(char limit){
 
 
        
+  // Auto-pick BLOCK_DIV based on actual daisy presence so the slot is sized
+  // for the line length we actually emit (8-ch ≈ 60 B, 16-ch ≈ 115 B).
+  // Skipped if the host already sent an explicit 'c' / 'C' override.
+  if (!sdBlockDivManual) BLOCK_DIV = board.daisyPresent ? 1 : 2;
+
   // use limit to determine file size
   switch(limit){
     case 'h':
@@ -242,6 +262,7 @@ boolean setupSDcard(char limit){
   
   // initialize write-time overrun error counter and min/max wirte time benchmarks
   overruns = 0;
+  sdErrs = 0; sdRetries = 0; board.ledSDError = false;
   maxWriteTime = 0;
   minWriteTime = 65000;
   byteCounter = 0;  // counter from 0 - 512
@@ -302,6 +323,96 @@ boolean closeSDfile(){
   
   // delay(100); // cool down
   return fileIsOpen;
+}
+
+
+
+// Meta-line raw-write protocol:
+//   host sends: 'M' <lenLo> <lenHi> <N bytes payload>
+// Returns true if the byte was consumed by the protocol (caller should skip
+// normal command dispatch). Length-bounded (cap 1024), time-bounded (1 s),
+// and rejected while streaming so it can never interleave with sample data.
+// On invalid length, transitions to drain state (4) that absorbs up to 1024
+// bytes of would-be payload so the host can't accidentally feed those bytes
+// into the normal command dispatcher.
+boolean sdMetaProcess(char c) {
+  if (sdMetaState != 0 && (millis() - sdMetaStart) > 1000) sdMetaState = 0;
+  if (sdMetaState == 0) {
+    if (c == 'M' && SDfileOpen && !board.streaming) {
+      sdMetaState = 1;
+      sdMetaCount = 0;
+      sdMetaSum   = 0;
+      sdMetaLen   = 0;
+      sdPendingErrs = 0;        // drop stale markers from a prior aborted META
+      sdMetaCorrupted = false;
+      sdMetaStart = millis();
+      return true;
+    }
+    return false;
+  }
+  if (sdMetaState == 1) {
+    sdMetaCount = (uint8_t)c;
+    sdMetaState = 2;
+  } else if (sdMetaState == 2) {
+    sdMetaCount |= ((uint16_t)(uint8_t)c) << 8;
+    if (sdMetaCount == 0) {
+      // empty payload — host explicitly said zero bytes; ACK and idle
+      sdMetaState = 0;
+      if (!board.streaming) { Serial0.println("META OK 0 0"); board.sendEOT(); }
+    } else if (sdMetaCount > 1024) {
+      // bad length: drain up to 1024 bytes so a host that already shipped
+      // the payload can't have those bytes leak into command dispatch
+      sdMetaCount = 1024;
+      sdMetaState = 4;
+      if (!board.streaming) { Serial0.println("META ERR"); board.sendEOT(); }
+    } else { sdMetaLen = sdMetaCount; sdMetaState = 3; }
+  } else if (sdMetaState == 3) { // write payload byte directly to SD cache
+    pCache[byteCounter++] = c;
+    sdMetaSum += (uint8_t)c;
+    if (byteCounter == 512) writeCache();
+    if (--sdMetaCount == 0) {
+      sdMetaState = 0;
+      // Flush any %E markers that were deferred while META was being written
+      // (writeCache may emit multiple of these if the SD failed across blocks).
+      // Pre-flush if fewer than 3 bytes remain in pCache to avoid overrun.
+      while (sdPendingErrs > 0) {
+        if (byteCounter > 509) writeCache();
+        pCache[byteCounter++] = '%';
+        pCache[byteCounter++] = 'E';
+        pCache[byteCounter++] = '\n';
+        sdPendingErrs--;
+      }
+      // Force-flush pCache to a block boundary so the META line(s) land on
+      // their own SD block(s) before we ACK. This makes META durably on-disk
+      // and isolates it from any later sample-write retry. Pad with newlines
+      // — they're harmless to text parsers (split to len-1 empty strings, no
+      // match against ^[0-9A-F]{2},).
+      uint32_t sdErrsBefore = sdErrs;
+      if (byteCounter > 0) {
+        while (byteCounter < 512) pCache[byteCounter++] = '\n';
+        writeCache();
+      }
+      if (!board.streaming) {
+        // Two failure modes feed META FAIL:
+        //   sdMetaCorrupted: an unrecoverable write happened *during* META payload
+        //                    (set in writeCache when state==3 and retry failed)
+        //   sdErrs > sdErrsBefore: the final pad-flush itself failed
+        // Either way, the host's retry logic re-sends META.
+        if (sdMetaCorrupted || sdErrs > sdErrsBefore) {
+          Serial0.println("META FAIL");
+        } else {
+          Serial0.print("META OK ");
+          Serial0.print(sdMetaLen);
+          Serial0.print(" ");
+          Serial0.println(sdMetaSum);
+        }
+        board.sendEOT();
+      }
+    }
+  } else { // sdMetaState == 4 — drain abandoned payload bytes
+    if (--sdMetaCount == 0) sdMetaState = 0;
+  }
+  return true;
 }
 
 
@@ -370,13 +481,35 @@ void writeCache(){
     }
     
     uint32_t tw = micros();  // start block write timer
+    boolean errOccurred = false;
     board.csLow(SD_SS);  // take spi
-    if(!card.writeData(pCache)) {
-      if (!board.streaming) {
-        Serial0.println("block write fail");
-        board.sendEOT();
+    boolean ok = card.writeData(pCache);
+    if (!ok) {
+      errOccurred = true;
+      sdErrs++;
+      board.ledSDError = true;
+      // single-shot recovery: stop & restart multi-block from the current block.
+      // sdRetries counts attempts issued (successful or not) so the footer
+      // counter matches the number of recovery cycles the firmware ran.
+      sdRetries++;
+      card.writeStop();
+      if (card.writeStart(bgnBlock + blockCounter, BLOCK_COUNT - blockCounter)) {
+        ok = card.writeData(pCache);  // capture retry result
       }
-    }   // write the block
+      if (!ok) {
+        // persistent failure: realign the card's multi-block pointer to the
+        // NEXT block so subsequent writes target the right position. The
+        // failed block stays as pre-erased whitespace; %E marker tells where.
+        // Guard count=0 on final block — closeSDfile fires this iteration anyway.
+        card.writeStop();
+        if (blockCounter + 1 < BLOCK_COUNT) {
+          card.writeStart(bgnBlock + blockCounter + 1, BLOCK_COUNT - blockCounter - 1);
+        }
+        // If this happened mid-META payload, flag corruption so the host gets
+        // META FAIL and can retry.
+        if (sdMetaState == 3) sdMetaCorrupted = true;
+      }
+    }
     board.csHigh(SD_SS);  // release spi
     tw = micros() - tw;      // stop block write timer
     if (tw > maxWriteTime) maxWriteTime = tw;  // check for max write time
@@ -391,7 +524,20 @@ void writeCache(){
 
     byteCounter = 0; // reset 512 byte counter for next block
     blockCounter++;    // increment BLOCK counter
-    
+
+    if (errOccurred) {
+      if (sdMetaState == 3) {
+        // Don't fragment the META line. Defer marker(s) to after META completes
+        // so the host can parse %META JSON cleanly. Footer's %Errors: still
+        // records the total count for any deferred markers that overflow.
+        if (sdPendingErrs < 255) sdPendingErrs++;
+      } else {
+        pCache[byteCounter++] = '%';
+        pCache[byteCounter++] = 'E';
+        pCache[byteCounter++] = '\n';
+      }
+    }
+
     if(blockCounter == BLOCK_COUNT-1){
       t = millis() - t;
 
@@ -495,6 +641,18 @@ void writeFooter(){
     byteCounter++;
   }
   convertToHex(overruns, 7, false);
+
+  for(int i=0; i<9; i++){
+    pCache[byteCounter] = pgm_read_byte_near(errStamp+i);
+    byteCounter++;
+  }
+  convertToHex(sdErrs, 7, false);
+
+  for(int i=0; i<10; i++){
+    pCache[byteCounter] = pgm_read_byte_near(retryStamp+i);
+    byteCounter++;
+  }
+  convertToHex(sdRetries, 7, false);
 
   for(int i=0; i<11; i++){
     pCache[byteCounter] = pgm_read_byte_near(blockTime+i);

@@ -1982,6 +1982,10 @@ void OpenBCI_32bit_Library::driveLed(void){
         ledMarkerFound = false;
         nextLedEvent = millis();
       }
+    } else if (ledSDError) {
+      // fast strobe — visibly different from normal SD-write blink
+      if (ledState == OFF) { ledState = ON;  nextLedEvent = millis() + 100; }
+      else                 { ledState = OFF; nextLedEvent = millis() + 300; }
     } else if (ledSDWrite) {
       if (ledState == OFF) {
           ledState = ON;
