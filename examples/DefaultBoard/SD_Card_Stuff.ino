@@ -93,6 +93,7 @@ prog_char maxTime[] PROGMEM = {  "%max Write time uS:\n"};  // 20
 prog_char overNum[] PROGMEM = {  "%Over:\n"};               //  7
 prog_char errStamp[] PROGMEM = { "%Errors:\n"};             //  9
 prog_char retryStamp[] PROGMEM = { "%Retries:\n"};          // 10
+prog_char reinitStamp[] PROGMEM = { "%Reinits:\n"};         // 10
 prog_char blockTime[] PROGMEM = {  "%block, uS\n"};         // 11    74 chars + 2 32(16) + 2 16(8) = 98 + (n 32x2) up to 24 overruns...
 prog_char stopStamp[] PROGMEM = {  "%STOP AT\n"};      // used to stamp SD record when stopped by PC
 prog_char startStamp[] PROGMEM = {  "%START AT\n"};    // used to stamp SD record when started by PC
@@ -455,6 +456,42 @@ boolean sdMetaProcess(char c) {
 
 
 void writeDataToSDcard(byte sampleNumber){
+  // Emit deferred markers at sample boundary BEFORE we start writing the new
+  // sample's CSV. byteCounter at function entry is positioned just after the
+  // previous sample's '\n' (or at 0 after a writeCache flush), so writes
+  // here cannot split a sample line. We only emit if the marker fits within
+  // the current 512-byte block — if it doesn't fit, defer to the next sample
+  // boundary (next block) since all markers are size-bounded.
+
+  // Flush any deferred %E markers (one per failed-write event the previous
+  // writeCache() recorded). Three bytes each; cheap to fit.
+  while (sdPendingErrs > 0 && byteCounter + 3 <= 512) {
+    pCache[byteCounter++] = '%';
+    pCache[byteCounter++] = 'E';
+    pCache[byteCounter++] = '\n';
+    sdPendingErrs--;
+  }
+
+  // Emit %CKPT heartbeat if the interval has elapsed and the line fits.
+  if (sdMetaState == 0 &&
+      ((uint32_t)(millis() - sdLastCkptMs) >= CKPT_INTERVAL_MS)) {
+    char tmp[80];
+    int n = snprintf(tmp, sizeof(tmp),
+                     "%%CKPT t=%lu b=%d e=%lu r=%lu n=%lu o=%lu\n",
+                     (unsigned long)millis(),
+                     blockCounter,
+                     (unsigned long)sdErrs,
+                     (unsigned long)sdRetries,
+                     (unsigned long)sdReinits,
+                     (unsigned long)overruns);
+    if (n > 0 && byteCounter + n <= 512) {
+      memcpy(pCache + byteCounter, tmp, n);
+      byteCounter += n;
+      sdLastCkptMs = millis();
+    }
+    // If it didn't fit in this block, retry on the next sample boundary.
+  }
+
   boolean addComma = true;
   // convert 8 bit sampleCounter into HEX
   convertToHex(sampleNumber, 1, addComma);
@@ -623,45 +660,17 @@ void writeCache(){
     blockCounter++;    // increment BLOCK counter
 
     if (errOccurred) {
-      if (sdMetaState == 3) {
-        // Don't fragment the META line. Defer marker(s) to after META completes
-        // so the host can parse %META JSON cleanly. Footer's %Errors: still
-        // records the total count for any deferred markers that overflow.
-        if (sdPendingErrs < 255) sdPendingErrs++;
-      } else {
-        pCache[byteCounter++] = '%';
-        pCache[byteCounter++] = 'E';
-        pCache[byteCounter++] = '\n';
-      }
+      // Defer the %E marker — emitting it here can split a sample line
+      // because writeCache() can be invoked mid-byte from convertToHex().
+      // sdPendingErrs is flushed at the next sample boundary by
+      // writeDataToSDcard(). Keep the same counter both for normal
+      // operation and the META-payload edge case (the META post-processing
+      // block also flushes sdPendingErrs).
+      if (sdPendingErrs < 255) sdPendingErrs++;
     }
-
-    // Periodic checkpoint marker — heartbeat + counter snapshot every ~1 min.
-    // Format: "%CKPT t=<ms> b=<block> e=<errs> r=<retries> n=<reinits> o=<over>\n"
-    // Fields: t = millis() at emit, b = blockCounter, e = writeData failures,
-    //         r = writeStart attempts, n = card.init() recovery cycles,
-    //         o = block-write overruns (>MICROS_PER_BLOCK).
-    // Skip during META payload (sdMetaState==3) so we never split META across blocks.
-    // The post-processor uses gaps between consecutive %CKPT t= values to detect
-    // recovery-induced sample drops and treat those windows as "no data".
-    if (sdMetaState == 0 &&
-        ((uint32_t)(millis() - sdLastCkptMs) >= CKPT_INTERVAL_MS)) {
-      char tmp[80];
-      int n = snprintf(tmp, sizeof(tmp),
-                       "%%CKPT t=%lu b=%d e=%lu r=%lu n=%lu o=%lu\n",
-                       (unsigned long)millis(),
-                       blockCounter,
-                       (unsigned long)sdErrs,
-                       (unsigned long)sdRetries,
-                       (unsigned long)sdReinits,
-                       (unsigned long)overruns);
-      if (n > 0 && byteCounter + n <= 512) {
-        memcpy(pCache + byteCounter, tmp, n);
-        byteCounter += n;
-        sdLastCkptMs = millis();
-      }
-      // If it didn't fit in this block we'll try again on the next; no point
-      // forcing a flush — the next block boundary is at most ~20 ms away.
-    }
+    // Note: %CKPT emission also moved out of writeCache() to writeDataToSDcard()
+    // for the same reason — heartbeat insertion mid-sample-line was breaking
+    // the CSV parser. See writeDataToSDcard() for the new placement.
 
     if(blockCounter == BLOCK_COUNT-1){
       t = millis() - t;
@@ -779,6 +788,12 @@ void writeFooter(){
   }
   convertToHex(sdRetries, 7, false);
 
+  for(int i=0; i<10; i++){
+    pCache[byteCounter] = pgm_read_byte_near(reinitStamp+i);
+    byteCounter++;
+  }
+  convertToHex(sdReinits, 7, false);
+
   for(int i=0; i<11; i++){
     pCache[byteCounter] = pgm_read_byte_near(blockTime+i);
     byteCounter++;
@@ -789,18 +804,6 @@ void writeFooter(){
     for (uint8_t i = 0; i < n; i++) {
       convertToHex(over[i].block, 7, true);
       convertToHex(over[i].micro, 7, false);
-    }
-  }
-
-  // Recovery-state footer: Reinits = full card.init() recovery cycles run.
-  {
-    char tmp[32];
-    int n = snprintf(tmp, sizeof(tmp),
-                     "\n%%Reinits:\n%07lu\n",
-                     (unsigned long)sdReinits);
-    if (n > 0 && byteCounter + n <= 512) {
-      memcpy(pCache + byteCounter, tmp, n);
-      byteCounter += n;
     }
   }
 
