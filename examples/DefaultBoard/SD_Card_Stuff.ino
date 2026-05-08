@@ -47,6 +47,36 @@ uint32_t sdMetaStart = 0;   // millis() when 'M' arrived (1 s timeout safety)
 uint8_t  sdPendingErrs = 0; // %E markers to emit AFTER META write completes (keeps the META line atomic)
 boolean  sdMetaCorrupted = false; // set when an UNRECOVERABLE writeCache fails during META state-3 only;
                                   // pad-flush failures are caught separately via sdErrs delta at ACK time
+// --- Recovery + checkpoint state (added 2026-05-08) ---
+// Closes a recovery hole: the original patch's skip-forward writeStart was fire-and-forget;
+// if it failed too, the multi-block context died silently and the firmware kept "writing"
+// to nowhere. Now we retry the skip-forward up to 5x; if those all fail, attempt one
+// full card.init() + writeStart as a last-resort recovery; if that also fails, declare
+// the card dead and tear down the open-file flags so the main loop stops calling
+// writeCache (rather than zombie-recording). Checkpoints are periodic markers in the SD
+// stream so a recording that ends early still has visible counters + heartbeat timeline.
+//
+// TRADE-OFF: recovery runs inline with SD_SS held low. The SD library has long internal
+// timeouts: writeData up to SD_WRITE_TIMEOUT (~600 ms), writeStop ~2x300 ms, each
+// writeStart calls waitNotBusy(300 ms). Realistic worst case per recovery event is on
+// the order of 1–2 seconds — during which the ADS1299 has no FIFO so we drop ~500–1000
+// samples (~1–2 s gap at 500 Hz). We accept this because the alternative — failing fast
+// at the first persistent error — costs the *rest of the night* of recording, which is
+// far worse than a visible gap. The post-processor will see the gap via missing
+// timestamps between %CKPT lines and treat it as "no data" for that interval.
+//
+// One card.init() per recovery event (not per session). If the card hiccups multiple
+// times across the night, sdReinits accumulates one per event. Each event ends in
+// either resumed=true (recording continues) or sdCardDead=true (clean stop, no further
+// init attempts because the early-return at the top of writeCache fires).
+//
+// SPI clock note: Sd2Card::init() ignores its sckRateID parameter when constructed with
+// a DSPI pointer (always ends at 20 MHz), and csLow(SD_SS) hard-sets 20 MHz on every
+// transaction. We cannot drop to half-speed without library-level changes.
+#define CKPT_INTERVAL_MS 60000UL    // emit a %CKPT line about once per minute
+boolean  sdCardDead    = false;     // skip-forward + card.init both failed; recording is over
+uint32_t sdReinits     = 0;         // card.init() recovery cycles run this session (one per recovery event)
+uint32_t sdLastCkptMs  = 0;         // last %CKPT emit time (millis())
 uint32_t maxWriteTime;  // keep track of longest write time
 uint32_t minWriteTime;  // and shortest write time
 uint32_t t;        // used to measure total file write time
@@ -263,6 +293,13 @@ boolean setupSDcard(char limit){
   // initialize write-time overrun error counter and min/max wirte time benchmarks
   overruns = 0;
   sdErrs = 0; sdRetries = 0; board.ledSDError = false;
+  // Intentional: a host-issued file-size command (h/A/S/.../K/L) starts a fresh
+  // recording and thereby acts as the manual recovery for a sdCardDead state from
+  // a prior session. The card.init() at the top of this function (line ~155) is
+  // the only init the firmware does at session start; in-session inline recovery
+  // does its own card.init() if needed (see writeCache).
+  sdCardDead = false; sdReinits = 0; sdLastCkptMs = millis();
+  sdMetaCorrupted = false; sdPendingErrs = 0;  // clear META flags from any prior dead-card event
   maxWriteTime = 0;
   minWriteTime = 65000;
   byteCounter = 0;  // counter from 0 - 512
@@ -474,12 +511,24 @@ void writeDataToSDcard(byte sampleNumber){
 
 
 void writeCache(){
-    
-    if(blockCounter > BLOCK_COUNT) {
-      blockCounter=0; 
+
+    // sdCardDead: skip-forward retry + half-speed re-init both failed earlier.
+    // The card is hard-stuck. Drop further sample data on the floor and tell
+    // the rest of the firmware the file is no longer open so callers stop
+    // pumping bytes through writeCache (which would otherwise hang the SPI bus).
+    if (sdCardDead) {
+      byteCounter = 0;
+      fileIsOpen = false;
+      SDfileOpen = false;
+      board.sdFileOpen = false;
       return;
     }
-    
+
+    if(blockCounter > BLOCK_COUNT) {
+      blockCounter=0;
+      return;
+    }
+
     uint32_t tw = micros();  // start block write timer
     boolean errOccurred = false;
     board.csLow(SD_SS);  // take spi
@@ -497,13 +546,61 @@ void writeCache(){
         ok = card.writeData(pCache);  // capture retry result
       }
       if (!ok) {
-        // persistent failure: realign the card's multi-block pointer to the
-        // NEXT block so subsequent writes target the right position. The
-        // failed block stays as pre-erased whitespace; %E marker tells where.
-        // Guard count=0 on final block — closeSDfile fires this iteration anyway.
+        // Persistent failure on the original block. Skip forward to the next
+        // block so subsequent writes target the right position. Retry the
+        // skip-forward writeStart up to 5x — the original code did it once
+        // fire-and-forget, which left the multi-block context dead silently
+        // when even the skip failed (root cause of the late-night silent halt).
+        //
+        // If 5x writeStart still fails, attempt one full card.init() to reset
+        // card-internal state and resume from the next block. This is the slow
+        // path (potentially ~1–2 seconds in the absolute worst case due to the
+        // SD library's internal timeouts on writeStop/writeStart/writeData) and
+        // will drop a corresponding burst of ADC samples — but the alternative
+        // is losing the rest of the recording, which is far worse. A visible
+        // gap in sample timestamps is preferable and detectable.
+        //
+        // Per-event cap: at most one card.init() per failure event in this
+        // function. If a second event happens later in the session sdReinits
+        // increments again. Real-card failures that won't recover after one
+        // init don't recover after ten either, so further inline retries
+        // would only worsen the gap.
         card.writeStop();
+        boolean resumed = false;
         if (blockCounter + 1 < BLOCK_COUNT) {
-          card.writeStart(bgnBlock + blockCounter + 1, BLOCK_COUNT - blockCounter - 1);
+          for (uint8_t a = 0; a < 5 && !resumed; a++) {
+            sdRetries++;  // counts attempts issued (success or fail) for footer accounting
+            if (card.writeStart(bgnBlock + blockCounter + 1, BLOCK_COUNT - blockCounter - 1)) {
+              resumed = true;
+            } else {
+              delay(1);
+            }
+          }
+          // Last-resort recovery: full card re-init. One attempt per failure event.
+          if (!resumed) {
+            sdReinits++;
+            if (card.init(SPI_FULL_SPEED, SD_SS) &&
+                card.writeStart(bgnBlock + blockCounter + 1, BLOCK_COUNT - blockCounter - 1)) {
+              resumed = true;
+            }
+          }
+        }
+        if (!resumed) {
+          // No path forward — tear down all open flags AND return immediately,
+          // so the rest of writeCache (checkpoint logic, footer-trigger check,
+          // close-trigger check) doesn't run on a dead card and the main loop
+          // in DefaultBoard.ino:45-47 stops calling writeDataToSDcard on the
+          // very next iteration. Recording ends here with whatever %CKPT
+          // markers landed on disk before this moment.
+          sdCardDead = true;
+          fileIsOpen = false;
+          SDfileOpen = false;
+          board.sdFileOpen = false;
+          board.csHigh(SD_SS);
+          // If this happened mid-META payload, flag corruption so the host
+          // gets META FAIL and can retry on the next session.
+          if (sdMetaState == 3) sdMetaCorrupted = true;
+          return;
         }
         // If this happened mid-META payload, flag corruption so the host gets
         // META FAIL and can retry.
@@ -536,6 +633,34 @@ void writeCache(){
         pCache[byteCounter++] = 'E';
         pCache[byteCounter++] = '\n';
       }
+    }
+
+    // Periodic checkpoint marker — heartbeat + counter snapshot every ~1 min.
+    // Format: "%CKPT t=<ms> b=<block> e=<errs> r=<retries> n=<reinits> o=<over>\n"
+    // Fields: t = millis() at emit, b = blockCounter, e = writeData failures,
+    //         r = writeStart attempts, n = card.init() recovery cycles,
+    //         o = block-write overruns (>MICROS_PER_BLOCK).
+    // Skip during META payload (sdMetaState==3) so we never split META across blocks.
+    // The post-processor uses gaps between consecutive %CKPT t= values to detect
+    // recovery-induced sample drops and treat those windows as "no data".
+    if (sdMetaState == 0 &&
+        ((uint32_t)(millis() - sdLastCkptMs) >= CKPT_INTERVAL_MS)) {
+      char tmp[80];
+      int n = snprintf(tmp, sizeof(tmp),
+                       "%%CKPT t=%lu b=%d e=%lu r=%lu n=%lu o=%lu\n",
+                       (unsigned long)millis(),
+                       blockCounter,
+                       (unsigned long)sdErrs,
+                       (unsigned long)sdRetries,
+                       (unsigned long)sdReinits,
+                       (unsigned long)overruns);
+      if (n > 0 && byteCounter + n <= 512) {
+        memcpy(pCache + byteCounter, tmp, n);
+        byteCounter += n;
+        sdLastCkptMs = millis();
+      }
+      // If it didn't fit in this block we'll try again on the next; no point
+      // forcing a flush — the next block boundary is at most ~20 ms away.
     }
 
     if(blockCounter == BLOCK_COUNT-1){
@@ -667,10 +792,22 @@ void writeFooter(){
     }
   }
 
+  // Recovery-state footer: Reinits = full card.init() recovery cycles run.
+  {
+    char tmp[32];
+    int n = snprintf(tmp, sizeof(tmp),
+                     "\n%%Reinits:\n%07lu\n",
+                     (unsigned long)sdReinits);
+    if (n > 0 && byteCounter + n <= 512) {
+      memcpy(pCache + byteCounter, tmp, n);
+      byteCounter += n;
+    }
+  }
+
   for(int i=byteCounter; i<512; i++){
     pCache[i] = NULL;
   }
- 
+
   writeCache();
 }
 
