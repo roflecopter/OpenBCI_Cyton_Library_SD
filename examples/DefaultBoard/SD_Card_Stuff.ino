@@ -306,36 +306,98 @@ boolean setupSDcard(char limit){
   byteCounter = 0;  // counter from 0 - 512
   blockCounter = 0; // counter from 0 - BLOCK_COUNT;
 
+  // Persist session config + advance session counters BEFORE %BOOT emit so the
+  // line carries the right session= value. Order matters: a true resume keeps
+  // the prior sessionSeq (chain shares one id); only a new/clean session bumps
+  // it. autoResume is set by setup() in DefaultBoard.ino before this fires.
+  if (fileIsOpen) {
+    EEPROM.write(10, (uint8_t)limit);                            // slotChar
+    EEPROM.write(11, (uint8_t)board.curSampleRate);              // ADS rate enum
+    if (!autoResume) {
+      sessionSeq++;
+      EEPROM.write(5, sessionSeq & 0xFF);
+      EEPROM.write(6, (sessionSeq >> 8) & 0xFF);
+      EEPROM.write(7, 0);                                        // reset retry cap
+      resumeCount = 0;
+      prevFileTens = 'N'; prevFileOnes = 'O';                    // → "prev=NONE"
+    }
+    EEPROM.write(4, 1);                                          // sessionActive — set LAST
+  }
+
   // Boot diagnostic stamp: visible as the very first bytes of every recording.
   // Written before %META / %START AT so it can never be lost to a mid-session
-  // failure. seq is the MCU boot counter (EEPROM-backed in DefaultBoard.ino),
-  // rcon is the PIC32 RCON snapshot from this boot (low byte: POR=0x01,
-  // BOR=0x02, IDLE=0x04, SLEEP=0x08, WDT=0x10, SWR=0x20, EXTR=0x40, VREGS=0x80).
-  // Compare consecutive files' seq numbers to detect silent overnight resets.
-  // Hand-rolled hex emit (no sprintf) — printf pulls in ~20 KB of libc on PIC32.
+  // failure. Format (fixed field count for parser simplicity):
+  //   %BOOT seq=NNNN rcon=0xNN session=NNNN prev=OBCI_XX.TXT resume=N
+  // - seq      : MCU boot counter (every reset bumps it)
+  // - rcon     : PIC32 RCON low byte from this boot. Bits per Microchip ref:
+  //              POR=0x01, BOR=0x02, IDLE=0x04, SLEEP=0x08, WDTO=0x10,
+  //              (bit5 unused), SWR=0x40, EXTR=0x80, VREGS=0x100, CMR=0x200.
+  // - session  : shared across a resume continuation chain; new session bumps it
+  // - prev     : previous file in the chain, or NONE when not a resume
+  // - resume   : 0 on the original session file, 1..3 on auto-resumed continuations
+  // Hand-rolled hex emit — printf would pull ~20 KB of libc on PIC32.
   if (fileIsOpen) {
-    static const char prefixA[] = "%BOOT seq=";   // 10 chars, no NUL written
-    static const char prefixB[] = " rcon=0x";     //  8 chars
-    for (uint8_t i = 0; i < 10; i++) {
-      pCache[byteCounter++] = (uint8_t)prefixA[i];
-      if (byteCounter == 512) writeCache();
+    static const char prefixA[] = "%BOOT seq=";       // 10 chars
+    static const char prefixB[] = " rcon=0x";         //  8 chars
+    static const char prefixC[] = " session=";        //  9 chars
+    static const char prefixD[] = " prev=OBCI_";      // 11 chars (rendered always; "NO" sentinel
+                                                      //          → "prev=OBCI_NO.TXT" parses as NONE
+                                                      //          but we want literal "NONE"; see below)
+    static const char prefixE[] = ".TXT resume=";     // 12 chars
+
+    // helper: write 4 nibbles of a u16 in big-endian
+    #define EMIT_HEX16(val) do { \
+      for (int8_t _n = 3; _n >= 0; _n--) { \
+        uint8_t _nib = ((val) >> (_n * 4)) & 0x0F; \
+        pCache[byteCounter++] = _nib < 10 ? '0' + _nib : 'A' + (_nib - 10); \
+        if (byteCounter == 512) writeCache(); \
+      } } while (0)
+    #define EMIT_HEX8(val) do { \
+      for (int8_t _n = 1; _n >= 0; _n--) { \
+        uint8_t _nib = ((uint8_t)(val) >> (_n * 4)) & 0x0F; \
+        pCache[byteCounter++] = _nib < 10 ? '0' + _nib : 'A' + (_nib - 10); \
+        if (byteCounter == 512) writeCache(); \
+      } } while (0)
+    #define EMIT_LIT(lit, n) do { \
+      for (uint8_t _i = 0; _i < (n); _i++) { \
+        pCache[byteCounter++] = (uint8_t)(lit)[_i]; \
+        if (byteCounter == 512) writeCache(); \
+      } } while (0)
+    #define EMIT_BYTE(b) do { \
+      pCache[byteCounter++] = (uint8_t)(b); \
+      if (byteCounter == 512) writeCache(); \
+    } while (0)
+
+    EMIT_LIT(prefixA, 10);
+    EMIT_HEX16(bootSeq);
+    EMIT_LIT(prefixB, 8);
+    EMIT_HEX8(bootResetCause);
+    EMIT_LIT(prefixC, 9);
+    EMIT_HEX16(sessionSeq);
+    // prev= field: real OBCI_XX.TXT for resumes, literal "NONE" for new sessions.
+    // Also fall back to NONE if the captured prev bytes are not valid hex
+    // digits (corrupt/virgin EEPROM), so the parser never sees a malformed
+    // OBCI_<garbage>.TXT filename.
+    boolean prevValid = autoResume
+        && ( (prevFileTens >= '0' && prevFileTens <= '9') || (prevFileTens >= 'A' && prevFileTens <= 'F') )
+        && ( (prevFileOnes >= '0' && prevFileOnes <= '9') || (prevFileOnes >= 'A' && prevFileOnes <= 'F') );
+    if (prevValid) {
+      EMIT_LIT(prefixD, 11);                    // " prev=OBCI_"
+      EMIT_BYTE(prevFileTens);
+      EMIT_BYTE(prevFileOnes);
+      EMIT_LIT(prefixE, 12);                    // ".TXT resume="
+    } else {
+      static const char prefixD_none[] = " prev=NONE resume=";   // 18 chars
+      EMIT_LIT(prefixD_none, 18);
     }
-    for (int8_t n = 3; n >= 0; n--) {             // 4 hex nibbles of seq
-      uint8_t nib = (bootSeq >> (n*4)) & 0x0F;
-      pCache[byteCounter++] = nib < 10 ? '0' + nib : 'A' + (nib - 10);
-      if (byteCounter == 512) writeCache();
-    }
-    for (uint8_t i = 0; i < 8; i++) {
-      pCache[byteCounter++] = (uint8_t)prefixB[i];
-      if (byteCounter == 512) writeCache();
-    }
-    for (int8_t n = 1; n >= 0; n--) {             // 2 hex nibbles of rcon low byte
-      uint8_t nib = (uint8_t)(bootResetCause >> (n*4)) & 0x0F;
-      pCache[byteCounter++] = nib < 10 ? '0' + nib : 'A' + (nib - 10);
-      if (byteCounter == 512) writeCache();
-    }
-    pCache[byteCounter++] = '\n';
-    if (byteCounter == 512) writeCache();
+    // resume count is 0..3 — emit as single ASCII digit
+    EMIT_BYTE('0' + (resumeCount > 9 ? 9 : resumeCount));
+    EMIT_BYTE('\n');
+
+    #undef EMIT_HEX16
+    #undef EMIT_HEX8
+    #undef EMIT_LIT
+    #undef EMIT_BYTE
   }
 
   if(fileIsOpen == true){  // send corresponding file name to controlling program
@@ -361,6 +423,14 @@ boolean setupSDcard(char limit){
 boolean closeSDfile(){
 
   if(fileIsOpen){
+    // Clear the auto-resume "session active" flag — a clean close means the
+    // next boot should NOT auto-resume into this session. We write this first
+    // (BEFORE writeStop / openfile.close) so even a power loss interrupting
+    // the close midway leaves the flag cleared. This is deliberate: an MCU
+    // reset *during* close is treated as not-resumable, since we may be in
+    // an indeterminate state (footer partially written, multi-block partly
+    // closed). Better to lose the resume than to chain into a corrupt file.
+    EEPROM.write(4, 0);
     board.csLow(SD_SS);  // take spi
     card.writeStop();
     openfile.close();
@@ -666,6 +736,10 @@ void writeCache(){
           fileIsOpen = false;
           SDfileOpen = false;
           board.sdFileOpen = false;
+          // Clear sessionActive so the next MCU reset won't auto-resume into a
+          // card we already declared dead — a fresh session start (host-driven
+          // recovery) is required to retry the card.
+          EEPROM.write(4, 0);
           board.csHigh(SD_SS);
           // If this happened mid-META payload, flag corruption so the host
           // gets META FAIL and can retry on the next session.
