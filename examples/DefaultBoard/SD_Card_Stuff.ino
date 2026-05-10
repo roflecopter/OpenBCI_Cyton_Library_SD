@@ -305,6 +305,39 @@ boolean setupSDcard(char limit){
   minWriteTime = 65000;
   byteCounter = 0;  // counter from 0 - 512
   blockCounter = 0; // counter from 0 - BLOCK_COUNT;
+
+  // Boot diagnostic stamp: visible as the very first bytes of every recording.
+  // Written before %META / %START AT so it can never be lost to a mid-session
+  // failure. seq is the MCU boot counter (EEPROM-backed in DefaultBoard.ino),
+  // rcon is the PIC32 RCON snapshot from this boot (low byte: POR=0x01,
+  // BOR=0x02, IDLE=0x04, SLEEP=0x08, WDT=0x10, SWR=0x20, EXTR=0x40, VREGS=0x80).
+  // Compare consecutive files' seq numbers to detect silent overnight resets.
+  // Hand-rolled hex emit (no sprintf) — printf pulls in ~20 KB of libc on PIC32.
+  if (fileIsOpen) {
+    static const char prefixA[] = "%BOOT seq=";   // 10 chars, no NUL written
+    static const char prefixB[] = " rcon=0x";     //  8 chars
+    for (uint8_t i = 0; i < 10; i++) {
+      pCache[byteCounter++] = (uint8_t)prefixA[i];
+      if (byteCounter == 512) writeCache();
+    }
+    for (int8_t n = 3; n >= 0; n--) {             // 4 hex nibbles of seq
+      uint8_t nib = (bootSeq >> (n*4)) & 0x0F;
+      pCache[byteCounter++] = nib < 10 ? '0' + nib : 'A' + (nib - 10);
+      if (byteCounter == 512) writeCache();
+    }
+    for (uint8_t i = 0; i < 8; i++) {
+      pCache[byteCounter++] = (uint8_t)prefixB[i];
+      if (byteCounter == 512) writeCache();
+    }
+    for (int8_t n = 1; n >= 0; n--) {             // 2 hex nibbles of rcon low byte
+      uint8_t nib = (uint8_t)(bootResetCause >> (n*4)) & 0x0F;
+      pCache[byteCounter++] = nib < 10 ? '0' + nib : 'A' + (nib - 10);
+      if (byteCounter == 512) writeCache();
+    }
+    pCache[byteCounter++] = '\n';
+    if (byteCounter == 512) writeCache();
+  }
+
   if(fileIsOpen == true){  // send corresponding file name to controlling program
     if(!board.streaming) {
       Serial0.print("Size ");

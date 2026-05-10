@@ -12,7 +12,29 @@ boolean addAccelToSD = false; // On writeDataToSDcard() call adds Accel data to 
 boolean addAuxToSD = false; // On writeDataToSDCard() call adds Aux data to SD card write
 boolean SDfileOpen = false; // Set true by SD_Card_Stuff.ino on successful file open
 
+// Boot diagnostic state (consumed by SD_Card_Stuff.ino → %BOOT line in every recording).
+// EEPROM bytes 0/1 are used for the SD file rotation counter; we use bytes 2/3 for bootSeq.
+uint32_t bootResetCause = 0;  // RCON snapshot at MCU setup() entry (pre-clear)
+uint16_t bootSeq        = 0;  // EEPROM-backed: increments on every MCU boot (POR/WDT/MCLR/BOR/SWR/...)
+
 void setup() {
+  // Capture MCU reset cause BEFORE anything that might touch RCON. Then clear
+  // the sticky bits so the next reset's cause is unambiguous (RCON accumulates
+  // bits across resets if not cleared).
+  bootResetCause = RCON;
+  RCONCLR = 0xFFFF;
+
+  // Boot counter — survives reset via EEPROM. Two consecutive recordings with
+  // bootSeq differing by N>1 means the MCU reset N-1 times between sessions
+  // (i.e. silent reboot mid-night, exactly the failure mode we're hunting).
+  uint8_t lo = EEPROM.read(2);
+  uint8_t hi = EEPROM.read(3);
+  bootSeq = ((uint16_t)hi << 8) | lo;
+  if (bootSeq == 0xFFFF) bootSeq = 0;   // virgin/erased EEPROM
+  bootSeq++;
+  EEPROM.write(2, bootSeq & 0xFF);
+  EEPROM.write(3, (bootSeq >> 8) & 0xFF);
+
   // Bring up the OpenBCI Board
   board.begin();
 
