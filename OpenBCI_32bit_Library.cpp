@@ -9,6 +9,11 @@ an OpenBCI 32bit board with an OpenBCI Daisy Module attached.
 
 #include "OpenBCI_32bit_Library.h"
 
+// Defined in the sketch (examples/DefaultBoard/SD_Card_Stuff.ino). Set by
+// replaySessionFile() when an auto-resume attempt aborted before streaming
+// started — drives the double-flash failure LED pattern in driveLed().
+extern boolean ledReplayFail;
+
 /***************************************************/
 /** PUBLIC METHODS *********************************/
 /***************************************************/
@@ -1986,6 +1991,16 @@ void OpenBCI_32bit_Library::driveLed(void){
       // fast strobe — visibly different from normal SD-write blink
       if (ledState == OFF) { ledState = ON;  nextLedEvent = millis() + 100; }
       else                 { ledState = OFF; nextLedEvent = millis() + 300; }
+    } else if (ledReplayFail) {
+      // Double-flash + 1 s pause = "auto-resume attempted but failed".
+      // Distinct from solid-idle (no SESSION.TXT) and from fast strobe
+      // (SD write error mid-recording). Four-phase cycle implemented via a
+      // small static counter.
+      static uint8_t replayFailPhase = 0;
+      if (replayFailPhase == 0)      { ledState = ON;  nextLedEvent = millis() + 100; replayFailPhase = 1; }
+      else if (replayFailPhase == 1) { ledState = OFF; nextLedEvent = millis() + 100; replayFailPhase = 2; }
+      else if (replayFailPhase == 2) { ledState = ON;  nextLedEvent = millis() + 100; replayFailPhase = 3; }
+      else                            { ledState = OFF; nextLedEvent = millis() + 1000; replayFailPhase = 0; }
     } else if (ledSDWrite) {
       if (ledState == OFF) {
           ledState = ON;

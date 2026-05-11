@@ -116,9 +116,379 @@ bool LED_SD_Status_Indication(uint8_t blinks_num, uint8_t blink_period_num, bool
     digitalWrite(OPENBCI_PIN_LED,LOW);
     return false;
   }
-  
+
 }
 
+
+// ---------------------------------------------------------------------------
+// SESSION.TXT persisted-session-config protocol (commands 'P' + boot replay)
+//
+// Design intent: a single file at SD root is the source of truth for "should
+// the cyton auto-resume on this boot, and with what config". File contents
+// are a literal byte stream of the OpenBCI host commands that session_start.py
+// would send to start a session (channel config xNGSIBPnX, sample rate ~N,
+// board mode /N, slot K, META M..., streaming b). At boot, if the file is
+// present and valid, the firmware feeds those bytes through the same three-
+// stage dispatch loop() uses for host serial bytes (sdMetaProcess →
+// sdProcessChar → board.processChar), reproducing the session start without
+// any host involvement.
+//
+// File framing:
+//   first 8 bytes  : "%PBEGIN\n"  magic header (detects partial / never-written
+//                    file vs torn mid-write — replay refuses if missing)
+//   payload        : raw command stream (any bytes, up to 1024)
+//   last 6 bytes   : "%PEND\n"    end sentinel
+//
+// Wire protocol (host → cyton) mirrors the existing M META protocol:
+//   'P' <lenLo> <lenHi> <up to 1024 bytes payload>
+//   ack: "PERSIST OK <len> <sum>\n$$$"  or  "PERSIST FAIL\n$$$"
+//
+// Why a separate opcode from M: M writes %META INLINE into the currently-open
+// OBCI_*.TXT recording file. P writes a SEPARATE file (SESSION.TXT). Different
+// destinations, different state machines.
+//
+// Why 'P' (not 'W'): the upstream OpenBCI protocol uses 'W' as CHANNEL_ON_10
+// (OpenBCI_32bit_Library_Definitions.h:233). 'P' is unused. Picked over 'B'
+// because P=Persist is mnemonic.
+// ---------------------------------------------------------------------------
+
+// State machine for the P command (mirrors sdMetaProcess shape exactly)
+uint8_t  sessState = 0;   // 0=idle, 1=need lenLo, 2=need lenHi, 3=copy payload, 4=drain bad len
+uint16_t sessLen   = 0;   // payload length parsed from lenLo|lenHi (also bytes-remaining in state 3)
+uint16_t sessTotal = 0;   // total payload bytes the host promised (echoed in ack)
+uint16_t sessSum   = 0;   // running 16-bit sum of payload bytes (echoed in ack)
+uint32_t sessStart = 0;   // millis() when 'P' arrived (1 s timeout safety)
+uint8_t  sessBuf[1024];   // RAM buffer for full payload (avoids SPI contention with any open
+                          // multi-block recording — though P is only valid when !streaming)
+
+// Replay mode flag — set true while replaySessionFile() is feeding bytes from
+// SESSION.TXT through processChar. Lets producers of host-facing chatter
+// (sdMetaProcess META OK lines, sdProcessChar size prints, processChar's
+// channel-set ACKs, board.sendEOT $$$) suppress output that would otherwise
+// confuse a host that's not even connected yet. Read by the chatter sites
+// directly — keep it global for cheap access.
+boolean replayingSession = false;
+
+// Tracks whether the post-replay success witness has fired this session.
+// Reset to false on every fresh setupSDcard. Set true (with EEPROM[7]=0
+// commit) on the first %CKPT emit after a successful replay — that's our
+// proof that the resume actually started writing samples. Subsequent CKPTs
+// in the same session are no-ops on EEPROM (flash wear).
+boolean firstCkptResetDone = false;
+
+// Set true when replaySessionFile() returned without starting streaming —
+// signals driveLed to emit a "replay attempted but failed" double-flash so
+// the user can distinguish "no SESSION.TXT present, idle on purpose" from
+// "tried to resume but something went wrong" without pulling the SD card.
+// driveLed needs to import this — declared in OpenBCI_32bit_Library too.
+boolean ledReplayFail = false;
+
+
+boolean sdPersistProcess(char c){
+  // 1 s safety timeout: if mid-state stalls, abort and let next byte start fresh
+  if (sessState != 0 && (millis() - sessStart) > 1000) sessState = 0;
+  if (sessState == 0) {
+    // Dispatch order in loop() puts sdPersistProcess BEFORE sdMetaProcess so
+    // that 'P' is intercepted at top level. But 'P' (ASCII 80) is also a
+    // perfectly valid byte inside an in-flight 'M' META payload (e.g. a JSON
+    // note containing "%CKPT" — the literal P would otherwise be hijacked
+    // here, the rest of the META payload would be mis-parsed as P-protocol
+    // length+payload bytes, and sdMetaProcess would never see the body it
+    // expects). Gate state-0 entry on sdMetaState == 0 so we never start a
+    // P transaction during an active META payload.
+    if (c == 'P' && !board.streaming && !replayingSession && sdMetaState == 0) {
+      // We require not-streaming to avoid contending the SD cache with active
+      // multi-block writes. replayingSession guard prevents recursive write
+      // from the replay path itself feeding our own bytes back through here.
+      sessState = 1;
+      sessLen   = 0;
+      sessTotal = 0;
+      sessSum   = 0;
+      sessStart = millis();
+      return true;
+    }
+    return false;
+  }
+  if (sessState == 1) { sessLen = (uint8_t)c; sessState = 2; return true; }
+  if (sessState == 2) {
+    sessLen |= ((uint16_t)(uint8_t)c) << 8;
+    if (sessLen == 0) {
+      sessState = 0;
+      if (!replayingSession) { Serial0.println("PERSIST ERR EMPTY"); board.sendEOT(); }
+      return true;
+    }
+    if (sessLen > 1024) {
+      sessLen   = 1024;        // drain at most a sane max so spurious bytes can't leak
+      sessState = 4;
+      if (!replayingSession) { Serial0.println("PERSIST ERR TOOBIG"); board.sendEOT(); }
+      return true;
+    }
+    sessTotal = sessLen;
+    sessState = 3;
+    return true;
+  }
+  if (sessState == 3) {
+    // Buffer in RAM. We won't open SESSION.TXT until the full payload is in
+    // hand — keeps the SD write atomic with respect to host's payload stream.
+    sessBuf[sessTotal - sessLen] = (uint8_t)c;
+    sessSum += (uint8_t)c;
+    sessLen--;
+    if (sessLen == 0) {
+      sessState = 0;
+      // Now write the file. Failure here doesn't corrupt any active recording
+      // — SESSION.TXT is independent of the OBCI_*.TXT files.
+      boolean ok = false;
+      uint8_t pfail = 0;   // diagnostic — last failed step, emitted in PERSIST FAIL response
+      if (!cardInit) {
+        if (card.init(SPI_FULL_SPEED, SD_SS)) cardInit = volume.init(card);
+      }
+      if (!cardInit) pfail = 1;
+      else {
+        // SdFile::openRoot returns false if `root` is already open. In this
+        // firmware, replaySessionFile (boot time) and setupSDcard both call
+        // root.openRoot(volume) and rely on the side-effect of pointing root
+        // at the volume's root cluster; setupSDcard explicitly doesn't check
+        // the return (line 249 just does `openvol = root.openRoot(volume);`
+        // and never reads openvol). Match that pattern — call it for the
+        // side-effect, ignore the return. (Was previously pfail=2 here when
+        // root was already open from boot, even though root state was valid.)
+        root.openRoot(volume);
+        // Remove any prior SESSION.TXT — start fresh. SdFile::remove returns
+        // 0 if the file doesn't exist; that's fine, we ignore the result.
+        SdFile::remove(&root, "SESSION.TXT");
+        SdFile sess;
+        // O_TRUNC dropped — the SdFat fork's open(..O_TRUNC) returned 0 in
+        // practice even though the file didn't exist (since we just removed
+        // it). O_CREAT | O_WRITE alone is sufficient on this fork.
+        if (!sess.open(&root, "SESSION.TXT", O_CREAT | O_WRITE)) pfail = 3;
+        else {
+          // Magic header first (eight bytes including the trailing newline)
+          const char hdr[] = "%PBEGIN\n";
+          const char ftr[] = "%PEND\n";
+          int wrote_hdr = sess.write((const uint8_t*)hdr, sizeof(hdr) - 1);
+          int wrote_pay = sess.write(sessBuf, sessTotal);
+          // Always terminate the payload with a newline before %PEND so the
+          // last command isn't glued to the sentinel (some host commands like
+          // 'X'-latch are single chars and need their own line/separator).
+          uint8_t nl = '\n';
+          sess.write(&nl, 1);
+          int wrote_ftr = sess.write((const uint8_t*)ftr, sizeof(ftr) - 1);
+          sess.sync();   // flush FAT cache so a power loss after ACK doesn't lose the file
+          sess.close();
+          ok = (wrote_hdr == (int)(sizeof(hdr) - 1)) &&
+               (wrote_pay == (int)sessTotal) &&
+               (wrote_ftr == (int)(sizeof(ftr) - 1));
+          if (!ok) {
+            // pfail codes 4..6 narrow down which write returned wrong byte count.
+            if (wrote_hdr != (int)(sizeof(hdr) - 1)) pfail = 4;
+            else if (wrote_pay != (int)sessTotal)    pfail = 5;
+            else                                     pfail = 6;
+          }
+        }
+      }
+      if (ok) {
+        // Successful new session config → reset resumeCount cap so the new
+        // session gets a fresh 3-strike budget for silent halts.
+        EEPROM.write(7, 0);
+      }
+      if (!replayingSession) {
+        if (ok) {
+          Serial0.print("PERSIST OK ");
+          Serial0.print(sessTotal);
+          Serial0.print(" ");
+          Serial0.println(sessSum);
+        } else {
+          // Emit pfail step code so the host can see which SD step failed:
+          // 1=card/volume init, 2=root open, 3=file open, 4=hdr write,
+          // 5=payload write, 6=footer write.
+          Serial0.print("PERSIST FAIL ");
+          Serial0.println(pfail);
+        }
+        board.sendEOT();
+      }
+    }
+    return true;
+  }
+  // sessState == 4: drain garbage payload bytes from a too-big header
+  if (sessState == 4) {
+    if (--sessLen == 0) sessState = 0;
+    return true;
+  }
+  return false;
+}
+
+
+// Boot-time replay of SESSION.TXT. Returns true if a replay was attempted (in
+// which case the cyton is now either streaming or has irrecoverably failed
+// the resume and is idle), false if no replay was warranted (no file, bad
+// framing, cap exhausted).
+//
+// Called from setup() after board.begin()+wifi.begin() so the ADS chips are
+// initialised before xNGSIBPnX lines reconfigure them. Reads the file
+// entirely into RAM and closes it BEFORE feeding bytes through processChar,
+// because the replay's `K` command will open a new multi-block recording
+// file on the same SdVolume — keeping SESSION.TXT's handle open during that
+// would contend the SD library's single-cached-block model.
+boolean replaySessionFile(){
+  // No Serial0.println diagnostics at boot — the dongle's RFduino link isn't
+  // established yet at this point, so any chatter floods the cyton-side TX
+  // buffer (the cyton-RFduino can't drain to radio fast enough), and worse,
+  // can wedge the link entirely. Use ledReplayFail double-flash + the SD
+  // STATUS path (later) as the sole failure indicators.
+
+  // Resume cap — bounds infinite-thrash on a dying cell. Reset to 0 on a
+  // successful replay (first %CKPT emit) and on a P command (new session).
+  uint8_t rc = EEPROM.read(7);
+  if (rc == 0xFF) rc = 0;
+  if (rc >= 3) {
+    // Hard cap — refuse and idle. Don't even open the SD; if the cell is
+    // truly dying we don't want to fail mid-resume yet again.
+    ledReplayFail = true;
+    return false;
+  }
+
+  if (!cardInit) {
+    if (card.init(SPI_FULL_SPEED, SD_SS)) cardInit = volume.init(card);
+  }
+  if (!cardInit) {
+    ledReplayFail = true;
+    return false;
+  }
+  if (!root.openRoot(volume)) {
+    ledReplayFail = true;
+    return false;
+  }
+
+  SdFile sess;
+  if (!sess.open(&root, "SESSION.TXT", O_READ)) {
+    // Normal case when there's no auto-resume to do — don't light the
+    // failure LED, just idle quietly so a clean morning power-on doesn't
+    // look like a failure.
+    return false;
+  }
+
+  uint32_t sz = sess.fileSize();
+  // Minimum viable file is the two markers with at least one command byte:
+  // "%PBEGIN\n" (8) + 1 byte + "\n" (1) + "%PEND\n" (6) = 16
+  if (sz < 16 || sz > (1024 + 32)) {
+    sess.close();
+    ledReplayFail = true;
+    return false;
+  }
+
+  // Read whole file into RAM. We reuse sessBuf — same 1024-byte buffer the
+  // P command uses; nobody else needs it at boot time.
+  uint8_t buf[1056];
+  int n = sess.read(buf, sz);
+  sess.close();
+  if (n != (int)sz) {
+    ledReplayFail = true;
+    return false;
+  }
+
+  // Validate header
+  static const char hdr[] = "%PBEGIN\n";
+  if (memcmp(buf, hdr, sizeof(hdr) - 1) != 0) {
+    ledReplayFail = true;
+    return false;
+  }
+  // Validate footer (last 6 bytes)
+  static const char ftr[] = "%PEND\n";
+  if (memcmp(buf + sz - (sizeof(ftr) - 1), ftr, sizeof(ftr) - 1) != 0) {
+    ledReplayFail = true;
+    return false;
+  }
+
+  // Pre-scan: enforce command ordering on top-level command lines. The
+  // xNGSIBPnX multi-char commands contain ASCII params that could falsely
+  // match our anchors, so scan line-by-line and only look at the first
+  // non-space char of each line.
+  //
+  // Required order: ~ (rate) before K (slot), K before M (META) if M
+  // present, K before b (stream start). We don't require all four — only
+  // the ones present must be in order.
+  uint8_t* p = buf + sizeof(hdr) - 1;
+  uint8_t* end = buf + sz - (sizeof(ftr) - 1);
+  int pos_tilde = -1, pos_K = -1, pos_M = -1, pos_b = -1, idx = 0;
+  uint8_t* lineStart = p;
+  while (lineStart < end) {
+    // Find first non-whitespace in this line
+    uint8_t* lp = lineStart;
+    while (lp < end && (*lp == ' ' || *lp == '\t')) lp++;
+    if (lp < end) {
+      char first = (char)*lp;
+      if (first == '~') pos_tilde = idx;
+      else if (first == 'K') pos_K = idx;
+      else if (first == 'M') pos_M = idx;
+      else if (first == 'b') pos_b = idx;
+    }
+    // Advance to next line
+    while (lineStart < end && *lineStart != '\n') lineStart++;
+    if (lineStart < end) lineStart++;   // skip the \n
+    idx++;
+  }
+  // Order checks — any pair that's both present must be in increasing order
+  if (pos_tilde >= 0 && pos_K >= 0 && pos_tilde > pos_K) {
+    ledReplayFail = true;
+    return false;
+  }
+  if (pos_K >= 0 && pos_M >= 0 && pos_K > pos_M) {
+    ledReplayFail = true;
+    return false;
+  }
+  if (pos_K >= 0 && pos_b >= 0 && pos_K > pos_b) {
+    ledReplayFail = true;
+    return false;
+  }
+  if (pos_M >= 0 && pos_b >= 0 && pos_M > pos_b) {
+    ledReplayFail = true;
+    return false;
+  }
+  // For sleep-EEG the typical config has all four, but a minimal recording
+  // (no META) is allowed.
+
+  // Bump resume cap BEFORE replay starts so a crash mid-replay still costs
+  // a retry — guards infinite-thrash. Update the in-memory `resumeCount`
+  // too so %BOOT's "resume=N" field reads the post-bump value (otherwise
+  // the line emits resume=0 even though EEPROM was just bumped to 1).
+  EEPROM.write(7, rc + 1);
+  resumeCount = rc + 1;
+
+  // Now actually replay. Feed each byte through the same three-stage dispatch
+  // that loop() uses for host serial bytes. Skip the %PBEGIN line entirely
+  // (don't want firmware to dispatch '%' as anything) and stop at %PEND.
+  //
+  // Set the global `autoResume` flag BEFORE the feed loop so that when the
+  // file's `K`/`A`/etc. slot command lands in setupSDcard, the %BOOT line it
+  // emits renders as "prev=OBCI_<NN>.TXT resume=N". Without this, the global
+  // is still its boot-default (false) at %BOOT-emit time and the line comes
+  // out as "prev=NONE resume=0" — losing the chain linkage the post-processor
+  // uses to thread a multi-file resumed session together.
+  autoResume         = true;
+  replayingSession   = true;
+  firstCkptResetDone = false;
+  uint8_t* feed = buf + sizeof(hdr) - 1;
+  while (feed < end) {
+    char c = (char)*feed++;
+    // sdPersistProcess gate (replayingSession=true keeps it inert, but feed
+    // it anyway for symmetry with loop())
+    if (!sdPersistProcess(c)) {
+      if (!sdMetaProcess(c)) {
+        sdProcessChar(c);
+        board.processChar(c);
+      }
+    }
+  }
+  replayingSession = false;
+
+  // Successful replay if streaming actually started. If it didn't, the
+  // resume failed somewhere — leave resumeCount bumped (so next boot may
+  // trip the cap), light the failure LED, and idle.
+  if (!board.streaming) {
+    ledReplayFail = true;
+  }
+  return board.streaming;
+}
 
 
 char sdProcessChar(char character) {
@@ -182,7 +552,15 @@ char sdProcessChar(char character) {
 
 
 boolean setupSDcard(char limit){
-    
+
+  // Every fresh setupSDcard call starts a new session — re-arm the
+  // "successful streaming witness" so the first %CKPT of THIS session
+  // resets EEPROM[7]=0 (resume cap). Without this, only the FIRST session
+  // since boot triggers the reset; subsequent host-`K` sessions on the
+  // same MCU uptime leave stale resumeCount values that could trip the
+  // cap on a later night.
+  firstCkptResetDone = false;
+
   if(!cardInit){
       if(!card.init(SPI_FULL_SPEED, SD_SS)) {
         if(!board.streaming) {
@@ -423,17 +801,42 @@ boolean setupSDcard(char limit){
 boolean closeSDfile(){
 
   if(fileIsOpen){
-    // Clear the auto-resume "session active" flag — a clean close means the
-    // next boot should NOT auto-resume into this session. We write this first
-    // (BEFORE writeStop / openfile.close) so even a power loss interrupting
-    // the close midway leaves the flag cleared. This is deliberate: an MCU
-    // reset *during* close is treated as not-resumable, since we may be in
-    // an indeterminate state (footer partially written, multi-block partly
-    // closed). Better to lose the resume than to chain into a corrupt file.
-    EEPROM.write(4, 0);
+    // Clean close = "user said stop, do not auto-resume on next boot".
+    //
+    // Order matters for the power-loss safety: the SESSION.TXT-presence flow
+    // makes the FILE the source of truth for whether replay should fire on
+    // next boot. EEPROM[7] is the resume-cap counter — EEPROM[7]=0 is the
+    // FRESH-CAP state (3 retries available), NOT a "no resume" signal. So:
+    //
+    //   (1) writeStop + openfile.close — end the SD multi-block-write
+    //       context (set up by setupSDcard's card.writeStart). Must come
+    //       first so the SD will accept FAT-modifying ops.
+    //   (2) SdFile::remove(SESSION.TXT) — THE authoritative "do not resume"
+    //       signal. Once this commits, no future boot will auto-resume.
+    //   (3) EEPROM[7]=0 (cap refresh) and EEPROM[4]=0 (legacy clear) —
+    //       hygiene only. NOT load-bearing on the resume decision. Doing
+    //       them AFTER step 2 ensures any power-loss interleaving doesn't
+    //       leave us in EEPROM[7]=0 + SESSION.TXT-still-present, which
+    //       would auto-resume on next boot despite the user's clean-close
+    //       intent. (Codex review 2026-05-11 flagged this ordering bug.)
+    //
+    // Power-loss windows after this reorder:
+    //   * before writeStop: SD multi-block context preserved on disk; next
+    //     boot's mount sees a partially-closed file (filefrag-style) but
+    //     the FAT entry is consistent. SESSION.TXT still present → boot
+    //     auto-resumes into a new file (same as a real silent halt).
+    //   * after writeStop, before remove: SESSION.TXT still on disk → boot
+    //     auto-resumes. EEPROM[7] still holds prior value. resumeCount
+    //     cap still bounds infinite-thrash. Same as silent halt.
+    //   * after remove, before EEPROM clear: SESSION.TXT gone → boot idles
+    //     cleanly. Cap counter may be stale but next P command resets it.
+    //   * after EEPROM clear: fully clean state.
     board.csLow(SD_SS);  // take spi
     card.writeStop();
     openfile.close();
+    SdFile::remove(&root, "SESSION.TXT");
+    EEPROM.write(7, 0);
+    EEPROM.write(4, 0);  // legacy migration clear
     board.csHigh(SD_SS);  // release the spi
     fileIsOpen = false;
     if(!board.streaming){ // verbosity. this also gets insterted as footer in openFile
@@ -591,6 +994,16 @@ void writeDataToSDcard(byte sampleNumber){
       memcpy(pCache + byteCounter, tmp, n);
       byteCounter += n;
       sdLastCkptMs = millis();
+      // Success witness for the resume-cap reset: first %CKPT in this
+      // session proves the resume reached steady-state streaming. Reset
+      // EEPROM[7]=0 so a dying-cell pattern of repeated silent halts gets
+      // a fresh 3-strike budget after each successful chunk, rather than
+      // exhausting the cap after 3 cumulative resets across the whole
+      // night. Guarded so we only write EEPROM once per session.
+      if (!firstCkptResetDone) {
+        EEPROM.write(7, 0);
+        firstCkptResetDone = true;
+      }
     }
     // If it didn't fit in this block, retry on the next sample boundary.
   }
@@ -736,9 +1149,13 @@ void writeCache(){
           fileIsOpen = false;
           SDfileOpen = false;
           board.sdFileOpen = false;
-          // Clear sessionActive so the next MCU reset won't auto-resume into a
-          // card we already declared dead — a fresh session start (host-driven
-          // recovery) is required to retry the card.
+          // Best-effort delete of SESSION.TXT so the next MCU reset won't
+          // auto-resume into a card we already declared dead — a fresh
+          // session start (host-driven recovery) is required to retry the
+          // card. May silently fail if the card is unwritable; that's OK,
+          // the resumeCount cap will still bound infinite-thrash.
+          SdFile::remove(&root, "SESSION.TXT");
+          // Legacy EEPROM[4] clear retained for migration safety.
           EEPROM.write(4, 0);
           board.csHigh(SD_SS);
           // If this happened mid-META payload, flag corruption so the host
