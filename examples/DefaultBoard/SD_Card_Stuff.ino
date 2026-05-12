@@ -67,8 +67,20 @@ boolean  sdMetaCorrupted = false; // set when an UNRECOVERABLE writeCache fails 
 //
 // One card.init() per recovery event (not per session). If the card hiccups multiple
 // times across the night, sdReinits accumulates one per event. Each event ends in
-// either resumed=true (recording continues) or sdCardDead=true (clean stop, no further
-// init attempts because the early-return at the top of writeCache fires).
+// either resumed=true (recording continues in same file) or — when ALL in-place
+// recovery is exhausted — executeSoftReset(0): hands control to the auto-resume
+// chain in setup(). RCON.SWR (0x40) is just the reset cause that ends up in
+// bootResetCause — replaySessionFile() itself gates only on SESSION.TXT presence
+// and resumeCount<3 (EEPROM[7]) (cause-based POR veto is a separate planned change
+// not yet wired in). On the SWR boot, replaySessionFile() re-runs the K/L/etc
+// command from SESSION.TXT; setupSDcard() allocates the NEXT OBCI_<N+1>.TXT slot
+// via incrementFileCounter; recording resumes in that fresh slot. resumeCount cap
+// (EEPROM[7]) bounds the chain at 3 attempts so a fully-dying card eventually idles
+// solid (ledReplayFail double-flash). This is "skip the bad block range, try the
+// next slot" — far better than declaring the whole card dead on a localized flash
+// failure (2026-05-12 design fix; before this, sdCardDead actively poisoned the
+// resume gates by deleting SESSION.TXT and clearing EEPROM[4], so a bad-block night
+// left the recording silently dead despite the chain mechanism being in place).
 //
 // SPI clock note: Sd2Card::init() ignores its sckRateID parameter when constructed with
 // a DSPI pointer (always ends at 20 MHz), and csLow(SD_SS) hard-sets 20 MHz on every
@@ -1248,28 +1260,50 @@ void writeCache(){
           }
         }
         if (!resumed) {
-          // No path forward — tear down all open flags AND return immediately,
-          // so the rest of writeCache (checkpoint logic, footer-trigger check,
-          // close-trigger check) doesn't run on a dead card and the main loop
-          // in DefaultBoard.ino:45-47 stops calling writeDataToSDcard on the
-          // very next iteration. Recording ends here with whatever %CKPT
-          // markers landed on disk before this moment.
+          // In-place recovery exhausted (5x skip-forward writeStart + 1x
+          // card.init+writeStart all failed). Two failure modes look the
+          // same here: a localized bad-block range in the current slot's
+          // extent (next slot will be fine) vs whole-card flash death
+          // (next slot will fail the same way). We can't distinguish at
+          // this layer, so we trigger the auto-resume chain to try the
+          // next slot: executeSoftReset(0) issues a software reset → next
+          // boot enters setup() with RCON.SWR=0x40, calls replaySessionFile()
+          // which reads SESSION.TXT (preserved on disk, not deleted here)
+          // and re-runs the original K/L/etc command → setupSDcard() bumps
+          // the OBCI_<N>.TXT counter and allocates the NEXT slot → recording
+          // resumes in that fresh extent. resumeCount cap (EEPROM[7]) bounds
+          // this chain to 3 attempts: bad-block scenario succeeds on attempt
+          // 1 or 2; whole-card-dead scenario exhausts to ledReplayFail.
+          //
+          // CRITICAL: preserve the auto-resume gates. Do NOT remove
+          // SESSION.TXT, do NOT clear EEPROM[4]. Both are what the chain
+          // needs to fire on the next boot. (Pre-2026-05-12 code did both
+          // here and silently defeated its own chain mechanism.)
+          //
+          // Release SPI before reset (defensive; reset will tear down all
+          // peripherals anyway, but a low CS line during the reset window
+          // could leave the SD card mid-transaction — releasing first is
+          // cleaner for the post-reset card.init() that runs in setup()).
+          board.csHigh(SD_SS);
+
+          // If this happened mid-META payload, flag corruption so the host
+          // gets META FAIL when it queries — though in practice the host
+          // won't see this response because we're about to reset.
+          if (sdMetaState == 3) sdMetaCorrupted = true;
+
+          // Software reset. Does not return. The new boot will read EEPROM
+          // (which we have NOT disturbed) and SESSION.TXT (which we have
+          // NOT removed), see sessionActive=1, see cause=SWR, see
+          // resumeCount<3, and run the auto-resume chain.
+          executeSoftReset(0);
+
+          // Unreachable, but keep the tear-down + sdCardDead=true as a
+          // belt-and-braces fallback in case executeSoftReset() ever
+          // returns (it shouldn't on PIC32MX, but defensive).
           sdCardDead = true;
           fileIsOpen = false;
           SDfileOpen = false;
           board.sdFileOpen = false;
-          // Best-effort delete of SESSION.TXT so the next MCU reset won't
-          // auto-resume into a card we already declared dead — a fresh
-          // session start (host-driven recovery) is required to retry the
-          // card. May silently fail if the card is unwritable; that's OK,
-          // the resumeCount cap will still bound infinite-thrash.
-          SdFile::remove(&root, "SESSION.TXT");
-          // Legacy EEPROM[4] clear retained for migration safety.
-          EEPROM.write(4, 0);
-          board.csHigh(SD_SS);
-          // If this happened mid-META payload, flag corruption so the host
-          // gets META FAIL and can retry on the next session.
-          if (sdMetaState == 3) sdMetaCorrupted = true;
           return;
         }
         // If this happened mid-META payload, flag corruption so the host gets
