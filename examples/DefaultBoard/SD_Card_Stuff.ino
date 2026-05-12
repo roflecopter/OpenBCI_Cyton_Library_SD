@@ -176,6 +176,18 @@ boolean replayingSession = false;
 // in the same session are no-ops on EEPROM (flash wear).
 boolean firstCkptResetDone = false;
 
+// Tracks sdErrs at the most recent %CKPT emit. If the next %CKPT shows the
+// same value (no new errors in the last ~60s), we know the recovery has
+// settled and clear ledSDError so the LED returns to the normal recording
+// pattern. Without this, a single transient SD hiccup at 03:00 leaves the
+// LED strobing the rest of the night even though recording is fine — the
+// morning user sees the strobe and can't tell whether recording is still
+// alive. With the auto-clear, the LED self-heals within ~60s of recovery,
+// so the morning state is a real-time "is it working RIGHT NOW" indicator
+// rather than a stale "did anything go wrong sometime tonight" alert. The
+// error counters in the file's %CKPT lines preserve the forensic history.
+uint32_t lastCkptSdErrs = 0;
+
 // Set true when replaySessionFile() returned without starting streaming —
 // signals driveLed to emit a "replay attempted but failed" double-flash so
 // the user can distinguish "no SESSION.TXT present, idle on purpose" from
@@ -329,12 +341,59 @@ boolean sdPersistProcess(char c){
 // because the replay's `K` command will open a new multi-block recording
 // file on the same SdVolume — keeping SESSION.TXT's handle open during that
 // would contend the SD library's single-cached-block model.
+// Best-effort SD writer for a tiny REPLAYFL.TXT forensic file. Called from
+// every failure return in replaySessionFile() with a code matching the
+// failure point — gives the morning user a way to know WHICH replay step
+// failed when ledReplayFail double-flash fires. Silent on SD-write errors:
+// if the card is unwritable (failure cause was cardInit itself) we just
+// skip and the user has only the LED + missing file as the indicator.
+//
+// File layout: ASCII line "code=N t=NNNms\n" — short enough to fit in one
+// directory entry's worth of clusters. Overwritten on each failed replay
+// so the LATEST failure is what the user sees; old causes don't accumulate.
+//
+// Codes:
+//   1 = resume cap exhausted (EEPROM[7] >= 3)
+//   2 = SD init / volume init failed (won't actually write the file in
+//       this case — the cardInit guard at function start refuses)
+//   3 = root.openRoot failed (refused for same reason as code 2)
+//   4 = SESSION.TXT size out of bounds (<16 or >1056)
+//   5 = SESSION.TXT short read
+//   6 = bad %PBEGIN header
+//   7 = bad %PEND footer
+//   8 = pre-scan: ~ after K
+//   9 = pre-scan: K after M
+//  10 = pre-scan: K after b
+//  11 = pre-scan: M after b
+//  12 = feed completed but board.streaming did not start
+static void writeReplayFail(uint8_t code){
+  if (!cardInit) return;
+  // root.openRoot returns false when already open (same gotcha as the
+  // sdPersistProcess fix on 2026-05-11) — replaySessionFile may have
+  // already opened root by the time we get here. Call for side-effect
+  // (point root at the volume's root cluster) and ignore the return —
+  // root is valid either way. Matches setupSDcard's pattern at line 249.
+  root.openRoot(volume);
+  SdFile::remove(&root, "REPLAYFL.TXT");
+  SdFile rf;
+  if (!rf.open(&root, "REPLAYFL.TXT", O_CREAT | O_WRITE)) return;
+  char b[40];
+  int n = snprintf(b, sizeof(b), "code=%u t=%lums\n",
+                   (unsigned)code, (unsigned long)millis());
+  if (n > 0) rf.write((const uint8_t*)b, n);
+  rf.sync();
+  rf.close();
+}
+
+
 boolean replaySessionFile(){
   // No Serial0.println diagnostics at boot — the dongle's RFduino link isn't
   // established yet at this point, so any chatter floods the cyton-side TX
   // buffer (the cyton-RFduino can't drain to radio fast enough), and worse,
-  // can wedge the link entirely. Use ledReplayFail double-flash + the SD
-  // STATUS path (later) as the sole failure indicators.
+  // can wedge the link entirely. Use ledReplayFail double-flash + the
+  // REPLAYFL.TXT forensic file (writeReplayFail) as the sole failure
+  // indicators. Codes 2/3 can't write the file (no SD); for those the user
+  // sees double-flash + absence of REPLAYFL.TXT = "SD itself is the issue".
 
   // Resume cap — bounds infinite-thrash on a dying cell. Reset to 0 on a
   // successful replay (first %CKPT emit) and on a P command (new session).
@@ -342,7 +401,11 @@ boolean replaySessionFile(){
   if (rc == 0xFF) rc = 0;
   if (rc >= 3) {
     // Hard cap — refuse and idle. Don't even open the SD; if the cell is
-    // truly dying we don't want to fail mid-resume yet again.
+    // truly dying we don't want to fail mid-resume yet again. cardInit
+    // hasn't run here so writeReplayFail will be a no-op — but a previous
+    // successful boot may have left cardInit=true from earlier in this
+    // power-up. Worth trying.
+    writeReplayFail(1);
     ledReplayFail = true;
     return false;
   }
@@ -351,13 +414,15 @@ boolean replaySessionFile(){
     if (card.init(SPI_FULL_SPEED, SD_SS)) cardInit = volume.init(card);
   }
   if (!cardInit) {
+    // Can't write REPLAYFL.TXT — SD itself is broken. LED double-flash +
+    // no file is the diagnostic ("LED says fail, but no REPLAYFL.TXT
+    // appeared after the morning processing" → it was an SD-init issue).
     ledReplayFail = true;
     return false;
   }
-  if (!root.openRoot(volume)) {
-    ledReplayFail = true;
-    return false;
-  }
+  // root.openRoot returns false when already open — same gotcha as writeReplayFail
+  // and sdPersistProcess (fixed 2026-05-11). Call for side-effect, ignore return.
+  root.openRoot(volume);
 
   SdFile sess;
   if (!sess.open(&root, "SESSION.TXT", O_READ)) {
@@ -372,6 +437,7 @@ boolean replaySessionFile(){
   // "%PBEGIN\n" (8) + 1 byte + "\n" (1) + "%PEND\n" (6) = 16
   if (sz < 16 || sz > (1024 + 32)) {
     sess.close();
+    writeReplayFail(4);
     ledReplayFail = true;
     return false;
   }
@@ -382,6 +448,7 @@ boolean replaySessionFile(){
   int n = sess.read(buf, sz);
   sess.close();
   if (n != (int)sz) {
+    writeReplayFail(5);
     ledReplayFail = true;
     return false;
   }
@@ -389,12 +456,14 @@ boolean replaySessionFile(){
   // Validate header
   static const char hdr[] = "%PBEGIN\n";
   if (memcmp(buf, hdr, sizeof(hdr) - 1) != 0) {
+    writeReplayFail(6);
     ledReplayFail = true;
     return false;
   }
   // Validate footer (last 6 bytes)
   static const char ftr[] = "%PEND\n";
   if (memcmp(buf + sz - (sizeof(ftr) - 1), ftr, sizeof(ftr) - 1) != 0) {
+    writeReplayFail(7);
     ledReplayFail = true;
     return false;
   }
@@ -429,18 +498,22 @@ boolean replaySessionFile(){
   }
   // Order checks — any pair that's both present must be in increasing order
   if (pos_tilde >= 0 && pos_K >= 0 && pos_tilde > pos_K) {
+    writeReplayFail(8);
     ledReplayFail = true;
     return false;
   }
   if (pos_K >= 0 && pos_M >= 0 && pos_K > pos_M) {
+    writeReplayFail(9);
     ledReplayFail = true;
     return false;
   }
   if (pos_K >= 0 && pos_b >= 0 && pos_K > pos_b) {
+    writeReplayFail(10);
     ledReplayFail = true;
     return false;
   }
   if (pos_M >= 0 && pos_b >= 0 && pos_M > pos_b) {
+    writeReplayFail(11);
     ledReplayFail = true;
     return false;
   }
@@ -482,9 +555,34 @@ boolean replaySessionFile(){
   replayingSession = false;
 
   // Successful replay if streaming actually started. If it didn't, the
-  // resume failed somewhere — leave resumeCount bumped (so next boot may
-  // trip the cap), light the failure LED, and idle.
+  // resume failed somewhere during the byte feed (most likely setupSDcard
+  // got called via 'K' but createContiguous failed, OR streamStart didn't
+  // fire properly). Leave resumeCount bumped (so next boot may trip the
+  // cap), light the failure LED, write the forensic file, and idle.
+  //
+  // CRITICAL: at this point setupSDcard MAY have opened an OBCI file in
+  // multi-block-write mode (the file's K command ran and reached writeStart
+  // before something else broke). writeReplayFail opens REPLAYFL.TXT on
+  // the same SdVolume — opening a second SdFile while a multi-block-write
+  // context is active will either silently no-op the write (same class of
+  // bug we hit in closeSDfile's SdFile::remove ordering) or worse corrupt
+  // the OBCI multi-block reservation. End the multi-block context first.
+  //
+  // NOTE: we deliberately do NOT call closeSDfile() here — that path deletes
+  // SESSION.TXT which we want to preserve so the next boot can RETRY the
+  // resume (resumeCount cap will eventually stop infinite-thrash). Manual
+  // writeStop + openfile.close keeps SESSION.TXT intact.
   if (!board.streaming) {
+    if (fileIsOpen) {
+      board.csLow(SD_SS);
+      card.writeStop();
+      openfile.close();
+      board.csHigh(SD_SS);
+      fileIsOpen = false;
+      SDfileOpen = false;
+      board.sdFileOpen = false;
+    }
+    writeReplayFail(12);
     ledReplayFail = true;
   }
   return board.streaming;
@@ -671,7 +769,7 @@ boolean setupSDcard(char limit){
   
   // initialize write-time overrun error counter and min/max wirte time benchmarks
   overruns = 0;
-  sdErrs = 0; sdRetries = 0; board.ledSDError = false;
+  sdErrs = 0; sdRetries = 0; board.ledSDError = false; lastCkptSdErrs = 0;
   // Intentional: a host-issued file-size command (h/A/S/.../K/L) starts a fresh
   // recording and thereby acts as the manual recovery for a sdCardDead state from
   // a prior session. The card.init() at the top of this function (line ~155) is
@@ -1004,6 +1102,17 @@ void writeDataToSDcard(byte sampleNumber){
         EEPROM.write(7, 0);
         firstCkptResetDone = true;
       }
+      // Auto-clear ledSDError when the current %CKPT shows no new errors
+      // since the previous %CKPT — i.e. the past ~60s of writes were clean,
+      // so any earlier transient SD hiccup has fully recovered. Without
+      // this, ledSDError sticks on for the rest of the session and the
+      // morning user can't distinguish "recording fine, had a glitch 6h ago"
+      // from "recording is currently broken". The forensic history is
+      // preserved in the %CKPT counters in the file (e=, r=, n=).
+      if (board.ledSDError && sdErrs == lastCkptSdErrs) {
+        board.ledSDError = false;
+      }
+      lastCkptSdErrs = sdErrs;
     }
     // If it didn't fit in this block, retry on the next sample boundary.
   }
