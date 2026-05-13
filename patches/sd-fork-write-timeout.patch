@@ -1,0 +1,47 @@
+Local fork edit for OpenBCI_32bit_SD library
+============================================
+
+File: <Arduino libraries dir>/OpenBCI_32bit_SD/utility/Sd2Card.h
+Change: SD_WRITE_TIMEOUT 600 ms → 1500 ms
+Date: 2026-05-13
+Reason: pSLC / high-endurance SD cards (SanDisk Max Endurance, Industrial)
+        do periodic background GC bursts that stall SPI for 200-500 ms.
+        At 600 ms, every overrun fires the firmware's inline 5x writeStart
+        retry → ~1 s of dropped samples per GC cycle (~6 events/min on
+        Max Endurance 32 GB → see OBCI_B6.TXT 2026-05-13: e=565 r=1020).
+        Raising to 1500 ms absorbs GC bursts up to ~1.5 s with NO sample
+        loss. Worst-case downside: a truly dead-card recovery event takes
+        ~1.5 s longer to declare failure, then the firmware's extended
+        recovery loop in writeCache (also added 2026-05-13) takes over.
+
+Re-apply manually after any reinstall of the SD library:
+
+    sed -i 's/uint16_t const SD_WRITE_TIMEOUT = 600;/uint16_t const SD_WRITE_TIMEOUT = 1500;/' \
+        ~/Arduino/libraries/OpenBCI_32bit_SD/utility/Sd2Card.h
+
+Diff:
+
+--- utility/Sd2Card.h.orig
++++ utility/Sd2Card.h
+@@ -91,7 +91,23 @@
+ /** read timeout ms */
+ uint16_t const SD_READ_TIMEOUT = 300;
+-/** write time out ms */
+-uint16_t const SD_WRITE_TIMEOUT = 600;
++/** write time out ms
++ *
++ * Raised 600 -> 1500 on 2026-05-13 to accommodate high-endurance / pSLC cards
++ * (e.g. SanDisk Max Endurance 32GB) whose internal background-GC bursts can
++ * stall SPI for 200-500 ms. The original 600 ms ceiling was right at that
++ * boundary - every GC overrun > 600 ms surfaced as a card.writeData() failure
++ * -> fired the inline 5x writeStart retry -> spent ~1 s of dropped samples per
++ * GC cycle. With 1500 ms ceiling, GC bursts up to ~1.5 s are absorbed
++ * silently with NO sample loss. Worst-case downside: a truly dead-card
++ * recovery event takes ~1.5 s longer to declare failure (the firmware's
++ * extended recovery loop in SD_Card_Stuff.ino's writeCache then takes over).
++ *
++ * NOTE: this is a local fork edit - the file lives outside the OpenBCI
++ * firmware repo (~/Arduino/libraries/OpenBCI_32bit_SD/). Re-apply if
++ * the SD library is reinstalled.
++ */
++uint16_t const SD_WRITE_TIMEOUT = 1500;

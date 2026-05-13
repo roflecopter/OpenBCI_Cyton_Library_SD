@@ -13,12 +13,14 @@ boolean addAuxToSD = false; // On writeDataToSDCard() call adds Aux data to SD c
 boolean SDfileOpen = false; // Set true by SD_Card_Stuff.ino on successful file open
 
 // Boot diagnostic state (used by setupSDcard's %BOOT line emit).
-// EEPROM layout (post-redesign 2026-05-11):
+// EEPROM layout (post-redesign 2026-05-11, cap raised 2026-05-13):
 //   0-1 : fileTens/fileOnes (existing — SD file rotation counter)
 //   2-3 : bootSeq (uint16, increments per MCU boot)
-//   7   : resumeCount (uint8, 0..3 — bounds infinite-thrash on a dying cell;
-//         reset to 0 on first %CKPT of a successful replay, on host 'j'
-//         clean close, and on a fresh P command)
+//   7   : resumeCount (uint8, 0..MAX_RESUMES — bounds infinite-thrash on a
+//         dying cell; reset to 0 on first %CKPT of a successful replay, on
+//         host 'j' clean close, and on a fresh P command. MAX_RESUMES is
+//         defined in SD_Card_Stuff.ino — currently 25 to cover ~16 GB / 1.2 GB
+//         ≈ 13 nightly slots × safety margin.)
 //
 // Legacy bytes 4 (sessionActive), 5/6 (sessionSeq), 10/11 (savedSlot/savedRate)
 // are no longer read by the firmware. They may still be written by setupSDcard
@@ -27,7 +29,7 @@ boolean SDfileOpen = false; // Set true by SD_Card_Stuff.ino on successful file 
 uint32_t bootResetCause = 0;  // RCON snapshot at MCU setup() entry (pre-clear)
 uint16_t bootSeq        = 0;  // increments on every MCU boot
 uint16_t sessionSeq     = 0;  // legacy field — kept so setupSDcard's %BOOT emit still works
-uint8_t  resumeCount    = 0;  // 0..3 cap, see EEPROM[7] notes above
+uint8_t  resumeCount    = 0;  // 0..MAX_RESUMES cap, see EEPROM[7] notes above
 boolean  autoResume     = false;  // true if replaySessionFile() succeeded
 char     prevFileTens   = 'N';    // captured at resume time so %BOOT can emit prev=OBCI_XX
 char     prevFileOnes   = 'O';    // sentinel "NO" → renders as prev=NONE when no prev exists
@@ -71,8 +73,8 @@ void setup() {
   wifi.begin(true, true);
 
   // SESSION.TXT replay. If a valid session-config file is on the SD root
-  // AND the resume-cap counter (EEPROM[7]) hasn't been blown by 3 prior
-  // failed attempts, this:
+  // AND the resume-cap counter (EEPROM[7]) hasn't been blown by MAX_RESUMES
+  // prior failed attempts, this:
   //   - reads SESSION.TXT into RAM (avoids SPI bus contention with the
   //     multi-block writes that follow)
   //   - validates %PBEGIN header + %PEND footer (rejects partial files)
@@ -85,8 +87,8 @@ void setup() {
   //   - The file's b command starts the ADS streaming firehose
   // EEPROM[7] resets to 0 on first %CKPT of the resumed session (success
   // witness, in writeDataToSDcard) — so dying-cell scenarios with repeated
-  // silent halts get a fresh 3-strike budget per successful chunk rather
-  // than exhausting the cap after 3 cumulative resets across the night.
+  // silent halts get a fresh MAX_RESUMES-strike budget per successful chunk
+  // rather than exhausting the cap across the night.
   // replaySessionFile sets the global `autoResume = true` internally before
   // it starts feeding bytes (so the K command's setupSDcard sees autoResume
   // and renders %BOOT prev=OBCI_<NN> resume=N correctly). If replay fails

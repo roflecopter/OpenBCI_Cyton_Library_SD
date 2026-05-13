@@ -57,7 +57,8 @@ boolean  sdMetaCorrupted = false; // set when an UNRECOVERABLE writeCache fails 
 // stream so a recording that ends early still has visible counters + heartbeat timeline.
 //
 // TRADE-OFF: recovery runs inline with SD_SS held low. The SD library has long internal
-// timeouts: writeData up to SD_WRITE_TIMEOUT (~600 ms), writeStop ~2x300 ms, each
+// timeouts: writeData up to SD_WRITE_TIMEOUT (raised to 1500 ms on 2026-05-13;
+// see Sd2Card.h for rationale), writeStop ~2x300 ms, each
 // writeStart calls waitNotBusy(300 ms). Realistic worst case per recovery event is on
 // the order of 1–2 seconds — during which the ADS1299 has no FIFO so we drop ~500–1000
 // samples (~1–2 s gap at 500 Hz). We accept this because the alternative — failing fast
@@ -71,12 +72,12 @@ boolean  sdMetaCorrupted = false; // set when an UNRECOVERABLE writeCache fails 
 // recovery is exhausted — executeSoftReset(0): hands control to the auto-resume
 // chain in setup(). RCON.SWR (0x40) is just the reset cause that ends up in
 // bootResetCause — replaySessionFile() itself gates only on SESSION.TXT presence
-// and resumeCount<3 (EEPROM[7]) (cause-based POR veto is a separate planned change
+// and resumeCount<MAX_RESUMES (EEPROM[7]) (cause-based POR veto is a separate planned change
 // not yet wired in). On the SWR boot, replaySessionFile() re-runs the K/L/etc
 // command from SESSION.TXT; setupSDcard() allocates the NEXT OBCI_<N+1>.TXT slot
 // via incrementFileCounter; recording resumes in that fresh slot. resumeCount cap
-// (EEPROM[7]) bounds the chain at 3 attempts so a fully-dying card eventually idles
-// solid (ledReplayFail double-flash). This is "skip the bad block range, try the
+// (EEPROM[7]) bounds the chain at MAX_RESUMES attempts so a fully-dying card
+// eventually idles solid (ledReplayFail double-flash). This is "skip the bad block range, try the
 // next slot" — far better than declaring the whole card dead on a localized flash
 // failure (2026-05-12 design fix; before this, sdCardDead actively poisoned the
 // resume gates by deleting SESSION.TXT and clearing EEPROM[4], so a bad-block night
@@ -84,10 +85,37 @@ boolean  sdMetaCorrupted = false; // set when an UNRECOVERABLE writeCache fails 
 //
 // SPI clock note: Sd2Card::init() ignores its sckRateID parameter when constructed with
 // a DSPI pointer (always ends at 20 MHz), and csLow(SD_SS) hard-sets 20 MHz on every
-// transaction. We cannot drop to half-speed without library-level changes.
+// transaction. SPI_HALF_SPEED is therefore a no-op via the DSPI path — we always run
+// at full 20 MHz. All call sites in this file pass SPI_FULL_SPEED for explicitness;
+// SPI_HALF_SPEED is intentionally never used here. (Kept the constant in the SD lib
+// to preserve the upstream API; it just has no effect on this board.)
+//
+// SD_WRITE_TIMEOUT was raised 600 → 1500 ms in the local SD-library fork on
+// 2026-05-13 to absorb pSLC GC bursts on Max Endurance / Industrial cards
+// without falsely tripping the multi-block recovery path. See Sd2Card.h.
 #define CKPT_INTERVAL_MS 60000UL    // emit a %CKPT line about once per minute
+// Resume cap (EEPROM[7]) ceiling. Bumped 3 → 25 on 2026-05-13 after a night
+// where one slot was created but recorded zero samples (controller wedged on
+// the very first block-write of the new slot), burning a full budget unit on
+// nothing useful. With per-good-CKPT reset, a healthy night gets effectively
+// unlimited retries; with cap=25 a true card-death scenario still idles instead
+// of thrashing the SD until physical exhaustion. EEPROM[7] is uint8 with 0xFF
+// reserved as virgin sentinel — anything <= 254 is safe.
+#define MAX_RESUMES 25
+// Extended in-place recovery window before falling back to slot recreation
+// (executeSoftReset). Added 2026-05-13. Inline writeStart retry (5x) + one
+// card.init+writeStart already covers brief stalls; this extends with a
+// delay+retry loop that drains host serial between attempts. Targets two
+// real-world failure modes: (a) SD-sniffer micro-movement causing brief
+// contact loss, (b) Max Endurance / pSLC controllers stalling SPI for
+// hundreds of ms during background GC bursts. Sample stream pauses during
+// the wait; gap is recorded in sdRetries (so next %CKPT shows the cost).
+#define EXT_RECOVERY_WINDOW_MS 8000UL
+#define EXT_RECOVERY_CHUNK_MS  500UL
 boolean  sdCardDead    = false;     // skip-forward + card.init both failed; recording is over
-uint32_t sdReinits     = 0;         // card.init() recovery cycles run this session (one per recovery event)
+uint32_t sdReinits     = 0;         // card.init() FAST-path recovery cycles run this session (1x per failure event)
+uint32_t sdExtRetries  = 0;         // EXTENDED-window card.init+writeStart attempts (added 2026-05-13);
+                                    // accumulates across the per-event 8 s window — ~1..16 per event
 uint32_t sdLastCkptMs  = 0;         // last %CKPT emit time (millis())
 uint32_t maxWriteTime;  // keep track of longest write time
 uint32_t minWriteTime;  // and shortest write time
@@ -106,6 +134,7 @@ prog_char overNum[] PROGMEM = {  "%Over:\n"};               //  7
 prog_char errStamp[] PROGMEM = { "%Errors:\n"};             //  9
 prog_char retryStamp[] PROGMEM = { "%Retries:\n"};          // 10
 prog_char reinitStamp[] PROGMEM = { "%Reinits:\n"};         // 10
+prog_char extRetryStamp[] PROGMEM = { "%ExtRetries:\n"};    // 13 (added 2026-05-13)
 prog_char blockTime[] PROGMEM = {  "%block, uS\n"};         // 11    74 chars + 2 32(16) + 2 16(8) = 98 + (n 32x2) up to 24 overruns...
 prog_char stopStamp[] PROGMEM = {  "%STOP AT\n"};      // used to stamp SD record when stopped by PC
 prog_char startStamp[] PROGMEM = {  "%START AT\n"};    // used to stamp SD record when started by PC
@@ -312,7 +341,7 @@ boolean sdPersistProcess(char c){
       }
       if (ok) {
         // Successful new session config → reset resumeCount cap so the new
-        // session gets a fresh 3-strike budget for silent halts.
+        // session gets a fresh MAX_RESUMES-strike budget for silent halts.
         EEPROM.write(7, 0);
       }
       if (!replayingSession) {
@@ -365,7 +394,7 @@ boolean sdPersistProcess(char c){
 // so the LATEST failure is what the user sees; old causes don't accumulate.
 //
 // Codes:
-//   1 = resume cap exhausted (EEPROM[7] >= 3)
+//   1 = resume cap exhausted (EEPROM[7] >= MAX_RESUMES)
 //   2 = SD init / volume init failed (won't actually write the file in
 //       this case — the cardInit guard at function start refuses)
 //   3 = root.openRoot failed (refused for same reason as code 2)
@@ -379,7 +408,23 @@ boolean sdPersistProcess(char c){
 //  11 = pre-scan: M after b
 //  12 = feed completed but board.streaming did not start
 static void writeReplayFail(uint8_t code){
-  if (!cardInit) return;
+  // Force a fresh card.init() before this short forensic write. By the
+  // time we land here the card is in a known-bad state (we're called
+  // precisely BECAUSE recovery has exhausted, OR because a higher-level
+  // condition like cap-exhaust fired with the card possibly degraded).
+  // A fresh card.init() resets controller-side state and gives our
+  // ~50-byte file its best shot at landing. Without this, a card that
+  // failed multi-block writes also failed the REPLAYFL write — leaving
+  // the morning user with only the LED double-flash, no forensic file
+  // (exactly what we observed on the 2026-05-13 night chain).
+  //
+  // If init/volume.init() truly fail (card physically dead), we silently
+  // return — the LED is still the user's primary indicator. Same fail-mode
+  // as before, just less likely.
+  if (!card.init(SPI_FULL_SPEED, SD_SS)) { cardInit = false; return; }
+  if (!volume.init(card)) { cardInit = false; return; }
+  cardInit = true;  // refresh state flag — caller may have stale value
+
   // root.openRoot returns false when already open (same gotcha as the
   // sdPersistProcess fix on 2026-05-11) — replaySessionFile may have
   // already opened root by the time we get here. Call for side-effect
@@ -409,9 +454,10 @@ boolean replaySessionFile(){
 
   // Resume cap — bounds infinite-thrash on a dying cell. Reset to 0 on a
   // successful replay (first %CKPT emit) and on a P command (new session).
+  // MAX_RESUMES governs the ceiling — see #define near top of file.
   uint8_t rc = EEPROM.read(7);
   if (rc == 0xFF) rc = 0;
-  if (rc >= 3) {
+  if (rc >= MAX_RESUMES) {
     // Hard cap — refuse and idle. Don't even open the SD; if the cell is
     // truly dying we don't want to fail mid-resume yet again. cardInit
     // hasn't run here so writeReplayFail will be a no-op — but a previous
@@ -787,7 +833,7 @@ boolean setupSDcard(char limit){
   // a prior session. The card.init() at the top of this function (line ~155) is
   // the only init the firmware does at session start; in-session inline recovery
   // does its own card.init() if needed (see writeCache).
-  sdCardDead = false; sdReinits = 0; sdLastCkptMs = millis();
+  sdCardDead = false; sdReinits = 0; sdExtRetries = 0; sdLastCkptMs = millis();
   sdMetaCorrupted = false; sdPendingErrs = 0;  // clear META flags from any prior dead-card event
   maxWriteTime = 0;
   minWriteTime = 65000;
@@ -878,8 +924,20 @@ boolean setupSDcard(char limit){
       static const char prefixD_none[] = " prev=NONE resume=";   // 18 chars
       EMIT_LIT(prefixD_none, 18);
     }
-    // resume count is 0..3 — emit as single ASCII digit
-    EMIT_BYTE('0' + (resumeCount > 9 ? 9 : resumeCount));
+    // resume count: 0..MAX_RESUMES. Emit as 1 or 2 ASCII digits — single
+    // digit when <10 (back-compat with pre-2026-05-13 parsers that only
+    // saw 0..3), two digits when >=10. Post-processor reads "resume=" up
+    // to whitespace/EOL so either width parses fine.
+    {
+      uint8_t rc_emit = resumeCount;
+      if (rc_emit > 99) rc_emit = 99;          // hard ceiling — display only
+      if (rc_emit >= 10) {
+        EMIT_BYTE('0' + (rc_emit / 10));
+        EMIT_BYTE('0' + (rc_emit % 10));
+      } else {
+        EMIT_BYTE('0' + rc_emit);
+      }
+    }
     EMIT_BYTE('\n');
 
     #undef EMIT_HEX16
@@ -916,7 +974,7 @@ boolean closeSDfile(){
     // Order matters for the power-loss safety: the SESSION.TXT-presence flow
     // makes the FILE the source of truth for whether replay should fire on
     // next boot. EEPROM[7] is the resume-cap counter — EEPROM[7]=0 is the
-    // FRESH-CAP state (3 retries available), NOT a "no resume" signal. So:
+    // FRESH-CAP state (MAX_RESUMES retries available), NOT a "no resume" signal. So:
     //
     //   (1) writeStop + openfile.close — end the SD multi-block-write
     //       context (set up by setupSDcard's card.writeStart). Must come
@@ -1092,14 +1150,18 @@ void writeDataToSDcard(byte sampleNumber){
   if (sdMetaState == 0 &&
       ((uint32_t)(millis() - sdLastCkptMs) >= CKPT_INTERVAL_MS)) {
     char tmp[80];
+    // %CKPT format extended 2026-05-13 with x= (extended-window attempts).
+    // Older parsers tolerant of unknown k=v fields will just skip x=; readers
+    // that want the new field can pull `x=(\d+)`.
     int n = snprintf(tmp, sizeof(tmp),
-                     "%%CKPT t=%lu b=%d e=%lu r=%lu n=%lu o=%lu\n",
+                     "%%CKPT t=%lu b=%d e=%lu r=%lu n=%lu o=%lu x=%lu\n",
                      (unsigned long)millis(),
                      blockCounter,
                      (unsigned long)sdErrs,
                      (unsigned long)sdRetries,
                      (unsigned long)sdReinits,
-                     (unsigned long)overruns);
+                     (unsigned long)overruns,
+                     (unsigned long)sdExtRetries);
     if (n > 0 && byteCounter + n <= 512) {
       memcpy(pCache + byteCounter, tmp, n);
       byteCounter += n;
@@ -1107,8 +1169,8 @@ void writeDataToSDcard(byte sampleNumber){
       // Success witness for the resume-cap reset: first %CKPT in this
       // session proves the resume reached steady-state streaming. Reset
       // EEPROM[7]=0 so a dying-cell pattern of repeated silent halts gets
-      // a fresh 3-strike budget after each successful chunk, rather than
-      // exhausting the cap after 3 cumulative resets across the whole
+      // a fresh MAX_RESUMES-strike budget after each successful chunk,
+      // rather than exhausting the cap after MAX_RESUMES cumulative resets across the whole
       // night. Guarded so we only write EEPROM once per session.
       if (!firstCkptResetDone) {
         EEPROM.write(7, 0);
@@ -1258,22 +1320,77 @@ void writeCache(){
               resumed = true;
             }
           }
+          // Extended recovery wait window (added 2026-05-13). The fast paths
+          // above (5x writeStart + 1x card.init+writeStart) cover ~hundreds
+          // of ms of brief stalls. This second-tier loop covers the longer
+          // failure modes that previously fell straight through to
+          // executeSoftReset (and burnt a full resume-cap unit on a slot
+          // that often recorded NOTHING after recreation):
+          //   (a) SD-sniffer micro-movement causing a brief contact loss
+          //       — usually clears after 100s of ms once contact restores
+          //   (b) Max Endurance / pSLC controllers stalling SPI for
+          //       hundreds of ms during background GC bursts — exceeds
+          //       SD_WRITE_TIMEOUT but resolves on the next card.init()
+          //   (c) Voltage-rail brown-outs on AA-battery-powered cytons
+          //       during card.init() inrush — settles after ~seconds
+          //
+          // Strategy: wait EXT_RECOVERY_WINDOW_MS total, retrying every
+          // EXT_RECOVERY_CHUNK_MS with a fresh card.init+writeStart. Drain
+          // host serial during the wait so the RFduino link stays alive
+          // (incoming bytes accumulating in the cyton-side FIFO would
+          // otherwise back up and eventually wedge the radio link).
+          // Discard those bytes — we can't safely process commands while
+          // mid-recovery (the SD layer is in flux).
+          //
+          // Sample stream pauses for the duration of the wait: ADS DRDY
+          // interrupts may fire but loop()'s updateChannelData isn't
+          // called while we're inside this delay loop, so samples are
+          // dropped at the source. The cost (up to EXT_RECOVERY_WINDOW_MS
+          // of dropped samples) is recorded in sdRetries; next %CKPT
+          // shows the delta. Visible gap >> losing rest of the night.
+          if (!resumed && blockCounter + 1 < BLOCK_COUNT) {
+            uint32_t windowStart = millis();
+            while (((uint32_t)(millis() - windowStart) < EXT_RECOVERY_WINDOW_MS) && !resumed) {
+              // Wait one chunk while draining host serial (1ms granularity
+              // so we don't spin CPU and can react quickly when the chunk
+              // boundary lands). EXT_RECOVERY_CHUNK_MS / 1ms = N iterations.
+              uint32_t chunkEnd = millis() + EXT_RECOVERY_CHUNK_MS;
+              while ((int32_t)(chunkEnd - millis()) > 0) {
+                delay(1);
+                while (board.hasDataSerial0()) (void)board.getCharSerial0();
+              }
+              // Use the dedicated extended-window counter (sdExtRetries)
+              // rather than sdReinits so the morning user can distinguish
+              //   n=N : real fast-path card.init events (1 per failure event)
+              //   x=N : extended-window attempts (up to ~16 per event)
+              // Conflating them was a confusing semantics change; keeping
+              // them separate preserves per-version comparability of the
+              // existing n= field.
+              sdExtRetries++;
+              if (card.init(SPI_FULL_SPEED, SD_SS) &&
+                  card.writeStart(bgnBlock + blockCounter + 1, BLOCK_COUNT - blockCounter - 1)) {
+                resumed = true;
+              }
+            }
+          }
         }
         if (!resumed) {
           // In-place recovery exhausted (5x skip-forward writeStart + 1x
-          // card.init+writeStart all failed). Two failure modes look the
-          // same here: a localized bad-block range in the current slot's
-          // extent (next slot will be fine) vs whole-card flash death
-          // (next slot will fail the same way). We can't distinguish at
-          // this layer, so we trigger the auto-resume chain to try the
-          // next slot: executeSoftReset(0) issues a software reset → next
-          // boot enters setup() with RCON.SWR=0x40, calls replaySessionFile()
+          // card.init+writeStart + EXT_RECOVERY_WINDOW_MS extended retry
+          // all failed). Two failure modes look the same here: a
+          // localized bad-block range in the current slot's extent (next
+          // slot will be fine) vs whole-card flash death (next slot will
+          // fail the same way). We can't distinguish at this layer, so
+          // we trigger the auto-resume chain to try the next slot:
+          // executeSoftReset(0) issues a software reset → next boot
+          // enters setup() with RCON.SWR=0x40, calls replaySessionFile()
           // which reads SESSION.TXT (preserved on disk, not deleted here)
           // and re-runs the original K/L/etc command → setupSDcard() bumps
           // the OBCI_<N>.TXT counter and allocates the NEXT slot → recording
           // resumes in that fresh extent. resumeCount cap (EEPROM[7]) bounds
-          // this chain to 3 attempts: bad-block scenario succeeds on attempt
-          // 1 or 2; whole-card-dead scenario exhausts to ledReplayFail.
+          // this chain to MAX_RESUMES attempts: bad-block scenario succeeds
+          // on the first few attempts; whole-card-dead scenario eventually
+          // exhausts to ledReplayFail.
           //
           // CRITICAL: preserve the auto-resume gates. Do NOT remove
           // SESSION.TXT, do NOT clear EEPROM[4]. Both are what the chain
@@ -1294,7 +1411,7 @@ void writeCache(){
           // Software reset. Does not return. The new boot will read EEPROM
           // (which we have NOT disturbed) and SESSION.TXT (which we have
           // NOT removed), see sessionActive=1, see cause=SWR, see
-          // resumeCount<3, and run the auto-resume chain.
+          // resumeCount<MAX_RESUMES, and run the auto-resume chain.
           executeSoftReset(0);
 
           // Unreachable, but keep the tear-down + sdCardDead=true as a
@@ -1460,6 +1577,12 @@ void writeFooter(){
     byteCounter++;
   }
   convertToHex(sdReinits, 7, false);
+
+  for(int i=0; i<13; i++){
+    pCache[byteCounter] = pgm_read_byte_near(extRetryStamp+i);
+    byteCounter++;
+  }
+  convertToHex(sdExtRetries, 7, false);
 
   for(int i=0; i<11; i++){
     pCache[byteCounter] = pgm_read_byte_near(blockTime+i);
