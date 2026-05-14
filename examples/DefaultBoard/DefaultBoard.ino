@@ -134,16 +134,28 @@ void loop() {
     // Read one char from the serial 0 port
     char newChar = board.getCharSerial0();
 
-    // 'P' SESSION.TXT-write protocol takes priority — when it consumes a byte
-    // the dispatch chain stops here. Falls through if the byte isn't part of a
-    // P transaction. Then the existing 'M' META intercept gets first refusal.
+    // Dispatch chain for inbound host bytes. Order matters — each handler
+    // returns true if it consumed the byte and the chain stops there.
+    //   P → tune → M → SD single-char → main command processor
+    //
+    // 'P' first: SESSION.TXT-write transactions can contain any byte in
+    //   their payload (incl. 'T', 'M'), so the P state machine must own
+    //   those bytes mid-transaction.
+    // 'T' second: tune is rare and self-contained; sdTuneProcess gates on
+    //   sessState==0 && sdMetaState==0 && !streaming so it only fires when
+    //   no other protocol is active. (Added 2026-05-15.)
+    // 'M' third: META payloads can contain 'T' bytes (JSON note strings),
+    //   but those land only AFTER sdMetaState != 0 — so T's gate keeps
+    //   them safe.
     if (!sdPersistProcess(newChar)) {
-      if (!sdMetaProcess(newChar)) {
-        // Send to the sd library for processing
-        sdProcessChar(newChar);
+      if (!sdTuneProcess(newChar)) {
+        if (!sdMetaProcess(newChar)) {
+          // Send to the sd library for processing
+          sdProcessChar(newChar);
 
-        // Send to the board library
-        board.processChar(newChar);
+          // Send to the board library
+          board.processChar(newChar);
+        }
       }
     }
   }

@@ -86,6 +86,28 @@ Added 2026-05-11. Lets a recording survive a silent MCU halt by automatically re
 
 Host can send a single-line ASCII `%META { ... }` JSON header before starting a recording, framed with a length-prefixed `M` opcode (`'M' <lenLo> <lenHi> <up to 1024 bytes>`). The firmware writes META atomically as the first 512-byte block of the file (newline-pad-flushed), then ACKs with `META OK <len> <sum>$$$` or `META FAIL$$$` if the SD write failed. Lets the recording be parsed without external sidecar metadata.
 
+### Runtime tunable recovery / SD constants — `T` protocol + `%TUNE`
+
+Added 2026-05-15 (ROADMAP item 1). Five previously-`#define`d recovery thresholds — `MAX_RESUMES`, `EXT_RECOVERY_WINDOW_MS`, `EXT_RECOVERY_CHUNK_MS`, `CKPT_INTERVAL_MS`, `SD_WRITE_TIMEOUT` — are now RAM-backed and rewritable mid-session. The host can A/B values per card class across nights without reflashing the cyton (bootloader dance is ~30 s/cycle and easy to miss the upload window).
+
+* **Wire protocol — `T` command**: host sends `'T' <key_id:1B> <value bytes, LSB-first, count implied by key>`. Firmware acks `TUNE OK <key_id>$$$` or `TUNE FAIL <code>$$$` (code 1 = unknown key, 2 = value out of range). Same gating model as `P` and `M`: `!board.streaming && !replayingSession && sdMetaState == 0 && sessState == 0`. Key IDs and value widths:
+
+  | key_id | name | C type | default | valid range |
+  |---|---|---|---|---|
+  | 0x01 | `MAX_RESUMES` | uint8 | 25 | 1..254 |
+  | 0x02 | `EXT_RECOVERY_WINDOW_MS` | uint16 | 8000 | 1..60000 |
+  | 0x03 | `EXT_RECOVERY_CHUNK_MS` | uint16 | 500 | 10..5000 (and ≤ window) |
+  | 0x04 | `CKPT_INTERVAL_MS` | uint32 | 60000 | 1000..3600000 |
+  | 0x05 | `SD_WRITE_TIMEOUT` | uint16 | 1500 | 100..5000 |
+
+  For 0x05, `SD_WRITE_TIMEOUT` lives in the SD library fork — see `patches/sd-fork-write-timeout.patch` for the const → extern conversion. Lowering `MAX_RESUMES` below the current `EEPROM[7]` value resets `EEPROM[7]=0` (preserves "raise the cap" intent).
+
+* **Persistence — `%TUNE` line in SESSION.TXT**: `session_start.py` prepends `%TUNE max_resumes=25 ext_recovery_ms=8000 ext_chunk_ms=500 ckpt_interval_ms=60000 sd_write_timeout=1500\n` to the SESSION.TXT payload. `replaySessionFile()` parses `%TUNE` lines line-by-line during the byte-feed loop BEFORE dispatching the rest of the body — so an auto-resumed continuation file inherits the same tuning state that produced the silent halt. Unknown keys are silently skipped (forward-compat with future additions). The `%TUNE` line bypasses the normal dispatch chain because some of its bytes (`T`, `U`, `E`) are valid OpenBCI command chars that would fire spurious `CHANNEL_ON_*` commands otherwise.
+
+* **Forensic visibility**: every `%CKPT` line now ends with `T=<hex8>` — an FNV-1a hash over the 5 tunables. Same tunable set → same hash, so each morning file self-documents which tuning was active. Pair with the `tune` block in `%META` JSON for the primary record. Hash is stable as long as the tunable set doesn't change shape; if a 6th tunable is added later, the hash will shift but old recordings remain parseable.
+
+* **Host knobs (`session_start.py`)**: optional `tune:` block in `session_start.yml`, plus `--tune key=value` CLI flag (repeatable) overlaying yml on top of firmware defaults. Both go through `tune_helpers.merge_tune()` which validates ranges before any serial I/O. Default behaviour (no yml block, no CLI) = firmware defaults; no T commands sent, and the `%TUNE` line still appears in SESSION.TXT documenting "everything at default".
+
 ### `BLOCK_DIV` auto-detect
 
 `BLOCK_DIV` (the slot-size divisor) is now auto-picked from `daisyPresent`: 1 for Cyton+Daisy (16 channels, longer per-line bytes), 2 for single Cyton. Previously a 12 H slot at 500 Hz Cyton-only was sized for the daisy line length and burned 2.49 GB of contiguous extent for ~half a usable recording; now it is correctly 1.24 GB. The host can still override explicitly via the `c` / `C` commands.
@@ -110,7 +132,6 @@ Modern controllers run two GC modes: inline (forced during writes when the SLC c
 
 * add external trigger to start sd writing with increased sampling rate and hardcoded config, without using a dongle at all
 * periodic checkpoint marker before/during META so a META FAIL has a more granular paper trail
-* runtime parametrisation of recovery thresholds (`MAX_RESUMES`, `EXT_RECOVERY_WINDOW_MS`, `EXT_RECOVERY_CHUNK_MS`, `CKPT_INTERVAL_MS`, `SD_WRITE_TIMEOUT`) via a new `T <key_id> <value>` wire command + `%TUNE k=v` SESSION.TXT line — see `ROADMAP.md` for full design
 
 ## Instructions
 
