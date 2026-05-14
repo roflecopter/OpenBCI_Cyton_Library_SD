@@ -410,7 +410,10 @@ boolean sdPersistProcess(char c){
 //   'T' <key_id:1B> <value bytes, LSB-first, count implied by key>
 //   ack: "TUNE OK <key_id>\n$$$"   on success
 //        "TUNE FAIL <code>\n$$$"   on failure (code: 1=unknown key,
-//                                              2=value out of range)
+//                                              2=value out of range,
+//                                              3=1s mid-transaction timeout —
+//                                                partial-tune bytes safely
+//                                                swallowed, host should resend)
 //
 // Value-byte counts by key (set in tuneKeyValueLength()):
 //   0x01 MAX_RESUMES             : 1 byte (uint8)
@@ -465,17 +468,22 @@ uint8_t applyTune(uint8_t key, uint32_t val) {
       // If EEPROM[7] (resumeCount) is already ≥ new cap, reset to 0 to
       // preserve "raise the cap" intent. The ROADMAP flagged this case:
       // without the reset, lowering MAX_RESUMES at runtime would
-      // immediately lock out auto-resume.
+      // immediately lock out auto-resume. Guarded read-then-write so a
+      // host re-tuning to the same value repeatedly doesn't burn EEPROM
+      // write cycles on a no-op.
       {
         uint8_t rc = EEPROM.read(7);
-        if (rc != 0xFF && rc >= tuneMaxResumes) EEPROM.write(7, 0);
+        if (rc != 0xFF && rc != 0 && rc >= tuneMaxResumes) EEPROM.write(7, 0);
       }
       return 0;
     case TUNE_KEY_EXT_RECOVERY_WINDOW_MS:
       // 0 would disable the extended window entirely (degrading recovery
       // back to the pre-2026-05-13 5x-retry path). Cap at 60 s so a typo
       // can't park the firmware in recovery for the rest of the night.
-      if (val == 0 || val > 60000UL) return 2;
+      // Cross-check: window must be ≥ current chunk or the window would
+      // degenerate to a single attempt (caller would then need to set
+      // chunk first). Symmetric to the chunk-setter's check below.
+      if (val == 0 || val > 60000UL || val < tuneExtRecoveryChunkMs) return 2;
       tuneExtRecoveryWindowMs = (uint16_t)val;
       return 0;
     case TUNE_KEY_EXT_RECOVERY_CHUNK_MS:
@@ -507,10 +515,18 @@ uint8_t applyTune(uint8_t key, uint32_t val) {
 // FNV-1a 32-bit over the 5 current tunables. Emitted in %CKPT as `T=<hex8>`
 // so a single line lets the post-processor identify which tuning set
 // produced the night's data (cross-checked against %META's `tune` block
-// for confidence). Stable as long as the tunable set doesn't change shape.
+// for confidence).
+//
+// Leading "domain version" byte makes the hash schema-stable: when a 6th
+// tunable is added later, bump TUNE_HASH_DOMAIN_VERSION so old recordings
+// hash-identify under v1 and new ones under v2 — saves a year-from-now
+// archaeology session ("which firmware version produced this hash?").
+// Hash space is wide enough that the extra byte costs nothing.
+#define TUNE_HASH_DOMAIN_VERSION 0x01
 uint32_t tuneSummaryHash() {
   uint32_t h = 0x811C9DC5UL;  // FNV-1a offset basis
   const uint32_t prime = 0x01000193UL;
+  h = (h ^ (uint32_t)TUNE_HASH_DOMAIN_VERSION) * prime;
   h = (h ^ (uint32_t)tuneMaxResumes) * prime;
   h = (h ^ (uint32_t)tuneExtRecoveryWindowMs) * prime;
   h = (h ^ (uint32_t)tuneExtRecoveryChunkMs) * prime;
@@ -519,9 +535,33 @@ uint32_t tuneSummaryHash() {
   return h;
 }
 
+// Reset all tune state-machine variables. Called on every state→0 transition
+// (success, failure, timeout) so a future maintainer adding a code path that
+// reads them mid-transition gets zeros, not stale leftovers.
+static inline void resetTuneState() {
+  tuneState        = 0;
+  tuneKey          = 0;
+  tuneVal          = 0;
+  tuneValPos       = 0;
+  tuneValBytesLeft = 0;
+}
+
 boolean sdTuneProcess(char c) {
   // 1 s safety timeout — mirrors sdPersistProcess + sdMetaProcess shape.
-  if (tuneState != 0 && (millis() - tuneStart) > 1000) tuneState = 0;
+  //
+  // CRITICAL: when the timeout fires we MUST also consume the byte that
+  // triggered the timeout check (return true) and emit a TUNE FAIL so the
+  // host learns its in-flight transaction was abandoned. Without this, a
+  // stalled value byte falls through to processChar and a value byte
+  // equal to 'b' / 'j' / a channel toggle would silently fire the wrong
+  // command. Emit FAIL code 3 = "timeout".
+  if (tuneState != 0 && (millis() - tuneStart) > 1000) {
+    resetTuneState();
+    Serial0.print("TUNE FAIL ");
+    Serial0.println(3);
+    board.sendEOT();
+    return true;
+  }
   if (tuneState == 0) {
     // Gate state-0 entry on every other state machine being idle — same
     // reasoning as P's `sdMetaState == 0` guard: a 'T' byte can appear
@@ -530,12 +570,9 @@ boolean sdTuneProcess(char c) {
     // contexts would hijack the wrong byte and break both protocols.
     if (c == 'T' && !board.streaming && !replayingSession
         && sdMetaState == 0 && sessState == 0) {
-      tuneState        = 1;
-      tuneKey          = 0;
-      tuneVal          = 0;
-      tuneValPos       = 0;
-      tuneValBytesLeft = 0;
-      tuneStart        = millis();
+      resetTuneState();
+      tuneState = 1;
+      tuneStart = millis();
       return true;
     }
     return false;
@@ -544,7 +581,7 @@ boolean sdTuneProcess(char c) {
     tuneKey = (uint8_t)c;
     tuneValBytesLeft = tuneKeyValueLength(tuneKey);
     if (tuneValBytesLeft == 0) {
-      tuneState = 0;
+      resetTuneState();
       Serial0.print("TUNE FAIL ");
       Serial0.println(1);   // unknown key code
       board.sendEOT();
@@ -560,11 +597,13 @@ boolean sdTuneProcess(char c) {
     tuneValPos++;
     tuneValBytesLeft--;
     if (tuneValBytesLeft == 0) {
-      uint8_t code = applyTune(tuneKey, tuneVal);
-      tuneState = 0;
+      uint8_t key = tuneKey;
+      uint32_t val = tuneVal;
+      uint8_t code = applyTune(key, val);
+      resetTuneState();
       if (code == 0) {
         Serial0.print("TUNE OK ");
-        Serial0.println((int)tuneKey);
+        Serial0.println((int)key);
       } else {
         Serial0.print("TUNE FAIL ");
         Serial0.println((int)code);
@@ -585,6 +624,18 @@ boolean sdTuneProcess(char c) {
 // Used by replaySessionFile() to apply %TUNE lines pulled from SESSION.TXT.
 // NOT used by sdTuneProcess (that's the binary form). The two share
 // applyTune() so the validation + side-effects stay in one place.
+//
+// Key names MUST match the host's `tune_helpers.py` TUNE_KEYS dict AND the
+// C variable names they map to. Renamed 2026-05-15 to remove an asymmetry
+// caught in review:
+//
+//   text                       C variable                     wire key
+//   ----                       ----------                     --------
+//   max_resumes                tuneMaxResumes                  0x01
+//   ext_recovery_window_ms     tuneExtRecoveryWindowMs         0x02
+//   ext_recovery_chunk_ms      tuneExtRecoveryChunkMs          0x03
+//   ckpt_interval_ms           tuneCkptIntervalMs              0x04
+//   sd_write_timeout           SD_WRITE_TIMEOUT (SD lib fork)  0x05
 void applyTuneTextLine(const uint8_t* buf, uint16_t len) {
   const uint8_t* p   = buf;
   const uint8_t* end = buf + len;
@@ -604,20 +655,28 @@ void applyTuneTextLine(const uint8_t* buf, uint16_t len) {
     while (p < end && *p != ' ' && *p != '\t') p++;
     uint16_t valLen = (uint16_t)(p - valStart);
     if (valLen == 0) continue;
-    // Parse value as decimal uint32. Reject on any non-digit (incl. '-').
+    // Parse value as decimal uint32. Reject on any non-digit (incl. '-')
+    // AND on overflow (anything that would wrap uint32). Earlier version
+    // relied on applyTune's range check to catch wrapped values — but a
+    // catastrophic typo like "ckpt_interval_ms=99999999999" would wrap
+    // into the valid range (1000..3600000) by luck, then apply silently.
     uint32_t v = 0;
     boolean bad = false;
     for (uint16_t i = 0; i < valLen; i++) {
       if (valStart[i] < '0' || valStart[i] > '9') { bad = true; break; }
-      v = v * 10 + (valStart[i] - '0');
+      uint32_t digit = (uint32_t)(valStart[i] - '0');
+      // Pre-multiplication overflow check: if v > (UINT32_MAX - digit) / 10
+      // then v*10 + digit would wrap. UINT32_MAX = 4294967295.
+      if (v > (4294967295UL - digit) / 10UL) { bad = true; break; }
+      v = v * 10UL + digit;
     }
     if (bad) continue;
     uint8_t kid = 0;
-    if      (keyLen == 11 && memcmp(keyStart, "max_resumes",      11) == 0) kid = TUNE_KEY_MAX_RESUMES;
-    else if (keyLen == 15 && memcmp(keyStart, "ext_recovery_ms",  15) == 0) kid = TUNE_KEY_EXT_RECOVERY_WINDOW_MS;
-    else if (keyLen == 12 && memcmp(keyStart, "ext_chunk_ms",     12) == 0) kid = TUNE_KEY_EXT_RECOVERY_CHUNK_MS;
-    else if (keyLen == 16 && memcmp(keyStart, "ckpt_interval_ms", 16) == 0) kid = TUNE_KEY_CKPT_INTERVAL_MS;
-    else if (keyLen == 16 && memcmp(keyStart, "sd_write_timeout", 16) == 0) kid = TUNE_KEY_SD_WRITE_TIMEOUT;
+    if      (keyLen == 11 && memcmp(keyStart, "max_resumes",            11) == 0) kid = TUNE_KEY_MAX_RESUMES;
+    else if (keyLen == 22 && memcmp(keyStart, "ext_recovery_window_ms", 22) == 0) kid = TUNE_KEY_EXT_RECOVERY_WINDOW_MS;
+    else if (keyLen == 21 && memcmp(keyStart, "ext_recovery_chunk_ms",  21) == 0) kid = TUNE_KEY_EXT_RECOVERY_CHUNK_MS;
+    else if (keyLen == 16 && memcmp(keyStart, "ckpt_interval_ms",       16) == 0) kid = TUNE_KEY_CKPT_INTERVAL_MS;
+    else if (keyLen == 16 && memcmp(keyStart, "sd_write_timeout",       16) == 0) kid = TUNE_KEY_SD_WRITE_TIMEOUT;
     if (kid != 0) applyTune(kid, v);
     // Unknown keys silently skipped — forward-compat with future tunables.
   }
@@ -707,7 +766,8 @@ boolean replaySessionFile(){
 
   // Resume cap — bounds infinite-thrash on a dying cell. Reset to 0 on a
   // successful replay (first %CKPT emit) and on a P command (new session).
-  // MAX_RESUMES governs the ceiling — see #define near top of file.
+  // tuneMaxResumes governs the ceiling — runtime-tunable since 2026-05-15
+  // (host T-protocol / %TUNE), defaults to DEFAULT_MAX_RESUMES near top.
   uint8_t rc = EEPROM.read(7);
   if (rc == 0xFF) rc = 0;
   if (rc >= tuneMaxResumes) {
@@ -852,13 +912,20 @@ boolean replaySessionFile(){
   replayingSession   = true;
   firstCkptResetDone = false;
   uint8_t* feed = buf + sizeof(hdr) - 1;
-  // Feed loop is now LINE-AWARE so `%TUNE k=v ...` lines can be parsed
-  // BEFORE the rest of the body reaches dispatch. Dispatching the raw bytes
-  // of "%TUNE max_resumes=25" through board.processChar would fire spurious
+  // Feed loop is LINE-AWARE so `%TUNE k=v ...` lines can be parsed BEFORE
+  // the rest of the body reaches dispatch. Dispatching the raw bytes of
+  // "%TUNE max_resumes=25" through board.processChar would fire spurious
   // CHANNEL_ON commands (the literal 'T','U','E' chars are top-level
-  // CHANNEL_ON_13/15/11 in the OpenBCI command set). The %TUNE line is
-  // consumed silently; the trailing newline IS still fed through so
-  // line-counting downstream stays consistent.
+  // CHANNEL_ON_13/15/11 in the OpenBCI command set).
+  //
+  // Two paths through the loop body:
+  //   - %TUNE line: applyTuneTextLine() parses the body, the ENTIRE LINE
+  //     including the trailing newline is consumed silently — NO bytes
+  //     reach dispatch. (See `feed = lineEnd + 1` below.)
+  //   - Non-%TUNE line: every byte INCLUDING the trailing newline is fed
+  //     through dispatch — same shape as the original loop body, just
+  //     re-anchored at line boundaries. The inner `feed <= lineEnd` (not
+  //     `<`) is what carries the `\n` through. Verified by review.
   while (feed < end) {
     uint8_t* lineEnd = feed;
     while (lineEnd < end && *lineEnd != '\n') lineEnd++;
