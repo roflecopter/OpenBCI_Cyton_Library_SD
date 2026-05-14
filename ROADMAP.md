@@ -76,36 +76,10 @@ b
 
 ---
 
-## Patch F (deferred): periodic forced idle
+## Morning SD health check (post-processing step)
 
-**Why:** even with `SD_WRITE_TIMEOUT` raised to 1500 ms, modern controllers might benefit from explicit idle windows for background GC. At 500 Hz the SPI bus is never idle long enough for the card to enter idle-GC mode → all GC happens inline.
+**Why:** a dying card surfaces as elevated `e/r/n/x` counters in `%CKPT` lines plus occasionally a silent halt. Catching the degradation *before* the next night's recording avoids losing irreplaceable EEG data. Morning is the natural place: the SD is already mounted on the laptop, the processing pipeline (`sd_convert.py` → BDF → ingestion) runs anyway, and any "card is dying" verdict has all day to act on (swap card, reformat, ship a fresh one to the bedside) before bedtime.
 
-**Approach:** insert a brief pause (~100 ms) every N seconds (~30 s) inside `writeCache()`, gated behind a `FORCED_IDLE_INTERVAL_MS` constant (or runtime tunable per the section above).
+**Approach:** add a short self-test step to the morning processing flow — write+verify a 1 MB pattern file on the SD, measure write-latency distribution, confirm zero errors. Cheap (~5–10 s on a healthy card vs the original 30 s evening proposal). Combine the live-write result with the parsed `%CKPT` counters from last night's TXT to produce a single "card health" verdict per morning. Persist verdicts in `sessions.db` so trends are visible (e.g. "Industrial 16 GB latency p95 has crept from 80 ms to 240 ms over 30 nights → schedule replacement").
 
-**When to ship:** after collecting a few nights of data with Patches A–E in place. If `e/r/n/x` counters in `%CKPT` are consistently near zero, F is unnecessary noise. If errors persist, size the idle window from the observed GC stall distribution rather than guessing.
-
----
-
-## Patch G (deferred): pre-erase / TRIM at session start
-
-**Why:** SD cards perform better when the controller knows which clusters are free. SdFat doesn't issue `CMD33`/`CMD38` ERASE; cards see all old slots as "still data" until overwritten. Erasing the next slot's clusters at session start (or as a `session_start.py` pre-step) primes the controller for fast linear writes.
-
-**Effort:** ~50 lines in the SD library fork. Defer until we see whether `%CKPT` counters stay low across multiple nights — if they do, G is premature optimisation.
-
----
-
-## Patch H (deferred): SDXC controller-mode detection + adaptive SPI clock
-
-**Why:** the SD library hardcodes 20 MHz SPI on the DSPI path (`SPI_HALF_SPEED` is a no-op). Some SDXC cards have signal-integrity issues at 20 MHz over the Cyton's 2013-era SD-slot traces. Memory's note at line 50: real half-speed support requires library-level changes.
-
-**Approach:** convert the hardcoded `_spi->setSpeed(20000000UL)` in `Sd2Card::init` and `csLow(SD_SS)` to read a runtime `_sckSpeedHz` member. Add `setSckSpeed(uint32_t hz)` setter. Wire to a tunable per the parametrisation section above.
-
-**When to ship:** if a specific card shows persistent CRC errors that the GC-busy hypothesis can't explain. So far Industrial 16 GB and Max Endurance 32 GB have no signal-integrity smell — pure GC behaviour.
-
----
-
-## Long-term: per-night pre-flight self-test
-
-Imagine session_start.py running a 30-second SD self-test before declaring the night ready: write+verify a 1 MB file, measure latency distribution, confirm no errors. Catches a dying card BEFORE the night starts instead of finding out at sunrise.
-
-Out of scope until the basic recovery + tuning loop is solid. Add a backlog ticket for Q3.
+**Where it lives:** the post-processing pipeline on p14s (alongside or inside `sd_convert.py`'s wrapper), not on the Cyton. No firmware change required.
