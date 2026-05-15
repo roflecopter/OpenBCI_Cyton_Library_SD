@@ -148,7 +148,11 @@ boolean  sdCardDead    = false;     // skip-forward + card.init both failed; rec
 uint32_t sdReinits     = 0;         // card.init() FAST-path recovery cycles run this session (1x per failure event)
 uint32_t sdExtRetries  = 0;         // EXTENDED-window card.init+writeStart attempts (added 2026-05-13);
                                     // accumulates across the per-event 8 s window — ~1..16 per event
-uint32_t sdLastCkptMs  = 0;         // last %CKPT emit time (millis())
+uint32_t sdLastCkptMs  = 0;         // last %CKPT emit time (millis()); soft-WDT input
+                                    // — refresh of this timestamp proves writeDataToSDcard
+                                    // is being called with samples (ISR alive + writeCache
+                                    // returning). Checked from loop() in DefaultBoard.ino
+                                    // against max(SOFT_WDT_FLOOR_MS, 2× tuneCkptIntervalMs).
 uint32_t maxWriteTime;  // keep track of longest write time
 uint32_t minWriteTime;  // and shortest write time
 uint32_t t;        // used to measure total file write time
@@ -495,7 +499,9 @@ uint8_t applyTune(uint8_t key, uint32_t val) {
     case TUNE_KEY_CKPT_INTERVAL_MS:
       // 1 s lower bound — sub-second CKPT would flood the file with meta.
       // 1 h upper bound — anything longer makes the morning user wait that
-      // long for the ledSDError auto-clear path.
+      // long for the ledSDError auto-clear path. The soft-WDT threshold in
+      // DefaultBoard.ino scales with this value as max(SOFT_WDT_FLOOR_MS,
+      // 2× tuneCkptIntervalMs), so any value in this range is safe.
       if (val < 1000UL || val > 3600000UL) return 2;
       tuneCkptIntervalMs = val;
       return 0;
@@ -1813,9 +1819,9 @@ void writeCache(){
     }
     
     if(blockCounter == BLOCK_COUNT){
-       SDfileOpen  = closeSDfile(); // Update open-file flag     
+       SDfileOpen  = closeSDfile(); // Update open-file flag
     }  // we did it!
-    
+
 }
 
 

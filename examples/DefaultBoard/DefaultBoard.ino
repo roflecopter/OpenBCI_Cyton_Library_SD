@@ -34,6 +34,15 @@ boolean  autoResume     = false;  // true if replaySessionFile() succeeded
 char     prevFileTens   = 'N';    // captured at resume time so %BOOT can emit prev=OBCI_XX
 char     prevFileOnes   = 'O';    // sentinel "NO" → renders as prev=NONE when no prev exists
 
+// Soft-WDT (added 2026-05-15) — forward-declared here because loop() references
+// these before the Arduino preprocessor reaches SD_Card_Stuff.ino. Threshold
+// floor = 120 s (2× the 60 s default CKPT cadence); scales up dynamically as
+// max(floor, 2× tuneCkptIntervalMs) so the host can tune CKPT cadence across
+// its full 1 s..1 h range without false-firing the WDT.
+extern uint32_t sdLastCkptMs;
+extern uint32_t tuneCkptIntervalMs;
+#define SOFT_WDT_FLOOR_MS  120000UL
+
 void setup() {
   // Capture MCU reset cause BEFORE anything that might touch RCON. Then clear
   // the sticky bits so the next reset's cause is unambiguous. NOTE: on the
@@ -174,6 +183,28 @@ void loop() {
   // Call the loop function on the board
   board.loop();
 
+  // Soft-WDT: catches loop()-progress hangs the SD-error cascade can't
+  // see (DRDY ISR dead, writeCache wedged behind a peripheral hang) by
+  // watching %CKPT heartbeat freshness. Gated on streaming AND
+  // SDfileOpen — the latter goes false at natural end-of-slot
+  // (closeSDfile in writeCache:~1819) while streaming stays true ("do
+  // not stop Streaming"); without this gate the WDT would false-fire
+  // ~120 s after every clean nightly recording. Threshold is dynamic:
+  // max(120 s floor, 2× current tuneCkptIntervalMs) so any host-tuned
+  // value in the 1 s..1 h range stays safe. Subtraction is uint32
+  // wrap-safe over the 49.7-day millis() rollover. Reset path: same
+  // SESSION.TXT auto-resume chain as writeCache's recovery-exhausted
+  // reset (~line 1764). No csHigh(SD_SS) before reset — by the time
+  // loop() reaches the WDT, CS has been raised on the last successful
+  // writeCache:1780 or by closeSDfile:~1353; the writeCache reset site
+  // at ~1764 needs the raise because CS is held low across its
+  // multi-block context, loop() doesn't.
+  if (board.streaming && SDfileOpen) {
+    uint32_t thresh = (uint32_t)tuneCkptIntervalMs * 2;
+    if (thresh < SOFT_WDT_FLOOR_MS) thresh = SOFT_WDT_FLOOR_MS;
+    if ((uint32_t)(millis() - sdLastCkptMs) > thresh) executeSoftReset(0);
+  }
+
   // Call to wifi loop
   wifi.loop();
 
@@ -188,9 +219,9 @@ void loop() {
     board.processCharWifi(newChar);
   }
 
-  if (!wifi.sentGains) {
-    if(wifi.present && wifi.tx) {
-      wifi.sendGains(board.numChannels, board.getGains());
-    }
-  }
+  // wifi.sentGains block removed 2026-05-15 to free 8 bytes of flash for
+  // the soft-WDT SDfileOpen gate. The OpenBCI WiFi Shield was never
+  // released (confirmed with the project owner), so wifi.present is
+  // always false on every real Cyton — this block was a no-op anyway.
+  // Restore from git history if a WiFi shield ever appears in the wild.
 }
