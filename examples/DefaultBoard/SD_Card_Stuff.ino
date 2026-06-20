@@ -1396,7 +1396,28 @@ boolean closeSDfile(){
 // bytes of would-be payload so the host can't accidentally feed those bytes
 // into the normal command dispatcher.
 boolean sdMetaProcess(char c) {
-  if (sdMetaState != 0 && (millis() - sdMetaStart) > 1000) sdMetaState = 0;
+  // D3a — INACTIVITY timeout (was absolute-from-'M'), refreshed on every byte below,
+  // so it only fires after the link has been quiet > 1 s. What we do on expiry depends
+  // on which state stalled:
+  //   - a RECEIVE state (1/2/3): the rest of the stalled payload may STILL arrive late
+  //     over the RF link, and those bytes must NOT fall through to the command
+  //     dispatcher (a delayed 'b'/digit would execute = silent corruption). So emit
+  //     META FAIL and enter the drain-until-quiet state (4), swallowing the triggering
+  //     byte and the dead tail.
+  //   - the DRAIN state (4): a >1 s gap means the dead tail has stopped and the link is
+  //     quiet, so THIS byte is a fresh command (the host's resync / 'b') — release it
+  //     (fall through) and process it normally.
+  if (sdMetaState != 0 && (millis() - sdMetaStart) > 1000) {
+    uint8_t prevState = sdMetaState;
+    sdMetaState = 0;
+    if (prevState != 4 && !board.streaming) { Serial0.println("META FAIL"); board.sendEOT(); }
+    if (prevState != 4) {            // 1/2/3 → drain the (possibly still-arriving) tail
+      sdMetaState = 4;
+      sdMetaStart = millis();        // arm the drain inactivity timer
+      return true;                   // swallow the timeout-triggering byte
+    }
+    // prevState == 4: fall through with sdMetaState now 0 → this post-quiet byte is real
+  }
   if (sdMetaState == 0) {
     if (c == 'M' && SDfileOpen && !board.streaming) {
       sdMetaState = 1;
@@ -1410,6 +1431,7 @@ boolean sdMetaProcess(char c) {
     }
     return false;
   }
+  sdMetaStart = millis();   // D3a — refresh the inactivity deadline on every frame byte
   if (sdMetaState == 1) {
     sdMetaCount = (uint8_t)c;
     sdMetaState = 2;
@@ -1420,21 +1442,39 @@ boolean sdMetaProcess(char c) {
       sdMetaState = 0;
       if (!board.streaming) { Serial0.println("META OK 0 0"); board.sendEOT(); }
     } else if (sdMetaCount > 1024) {
-      // bad length: drain up to 1024 bytes so a host that already shipped
-      // the payload can't have those bytes leak into command dispatch
-      sdMetaCount = 1024;
+      // bad length: drain-until-quiet (no fixed count) so a host that ships MORE than
+      // it declared can't have the overflow leak into command dispatch — the top
+      // inactivity timeout releases us once the burst stops. (A fixed-count drain
+      // under-drains an over-length burst and leaks the remainder.)
       sdMetaState = 4;
       if (!board.streaming) { Serial0.println("META ERR"); board.sendEOT(); }
     } else { sdMetaLen = sdMetaCount; sdMetaState = 3; }
-  } else if (sdMetaState == 3) { // write payload byte directly to SD cache
-    pCache[byteCounter++] = c;
+  } else if (sdMetaState == 3) {
+    // D2 — RAM-STAGE the whole payload, then write once. NO SD write happens
+    // while bytes are arriving, so a blocking writeCache() can never starve the
+    // UART RX FIFO and drop a payload byte mid-frame (the act-20 bug: byteCounter
+    // ~57 from the un-flushed %BOOT line + a >455 B payload used to cross the 512
+    // boundary mid-frame). Mirrors the proven 'P' path (sdPersistProcess). sessBuf
+    // reuse is safe: a 'P' byte inside this payload cannot start a P transaction
+    // because sdPersistProcess gates state-0 entry on sdMetaState == 0, so P never
+    // touches sessBuf during an active META.
+    sessBuf[sdMetaLen - sdMetaCount] = (uint8_t)c;
     sdMetaSum += (uint8_t)c;
-    if (byteCounter == 512) writeCache();
     if (--sdMetaCount == 0) {
-      sdMetaState = 0;
-      // Flush any %E markers that were deferred while META was being written
-      // (writeCache may emit multiple of these if the SD failed across blocks).
-      // Pre-flush if fewer than 3 bytes remain in pCache to avoid overrun.
+      // Full payload in RAM. COMMIT: replay into pCache via the EXISTING
+      // writeCache() 512-boundary path (NOT SdFile::write — M writes inside the
+      // active contiguous OBCI recording, so pCache/byteCounter/blockCounter
+      // alignment must be preserved for the following %START AT + sample CSV).
+      // These blocking writes now happen AFTER RX is complete, while the host is
+      // waiting for the ACK and sending nothing — so no byte can be dropped.
+      // Keep sdMetaState == 3 through the replay AND the pad-flush so a failed
+      // writeCache() still sets sdMetaCorrupted (the only correct fail signal).
+      for (uint16_t i = 0; i < sdMetaLen; i++) {
+        pCache[byteCounter++] = sessBuf[i];
+        if (byteCounter == 512) writeCache();
+      }
+      // Flush any %E markers deferred during the replay (writeCache may emit
+      // several if the SD failed across blocks). Pre-flush if < 3 bytes remain.
       while (sdPendingErrs > 0) {
         if (byteCounter > 509) writeCache();
         pCache[byteCounter++] = '%';
@@ -1442,23 +1482,22 @@ boolean sdMetaProcess(char c) {
         pCache[byteCounter++] = '\n';
         sdPendingErrs--;
       }
-      // Force-flush pCache to a block boundary so the META line(s) land on
-      // their own SD block(s) before we ACK. This makes META durably on-disk
-      // and isolates it from any later sample-write retry. Pad with newlines
-      // — they're harmless to text parsers (split to len-1 empty strings, no
-      // match against ^[0-9A-F]{2},).
-      uint32_t sdErrsBefore = sdErrs;
+      // Force-flush pCache to a block boundary so the META line(s) land on their
+      // own SD block(s) before we ACK — durable + isolated from later sample
+      // writes. Pad with newlines (harmless to the text parser: split to len-1
+      // empty strings, no match against ^[0-9A-F]{2},).
       if (byteCounter > 0) {
         while (byteCounter < 512) pCache[byteCounter++] = '\n';
         writeCache();
       }
+      sdMetaState = 0;   // leave state 3 only AFTER every writeCache() above
       if (!board.streaming) {
-        // Two failure modes feed META FAIL:
-        //   sdMetaCorrupted: an unrecoverable write happened *during* META payload
-        //                    (set in writeCache when state==3 and retry failed)
-        //   sdErrs > sdErrsBefore: the final pad-flush itself failed
-        // Either way, the host's retry logic re-sends META.
-        if (sdMetaCorrupted || sdErrs > sdErrsBefore) {
+        // D3b — verdict on sdMetaCorrupted ALONE. The old `sdErrs > before` check
+        // false-FAILed when a writeData hiccup was recovered by the same-block
+        // retry (no data lost). sdMetaCorrupted is set only on a genuine
+        // META-block-losing skip-forward — including during the pad-flush above,
+        // because we held state == 3 through it.
+        if (sdMetaCorrupted) {
           Serial0.println("META FAIL");
         } else {
           Serial0.print("META OK ");
@@ -1469,8 +1508,24 @@ boolean sdMetaProcess(char c) {
         board.sendEOT();
       }
     }
-  } else { // sdMetaState == 4 — drain abandoned payload bytes
-    if (--sdMetaCount == 0) sdMetaState = 0;
+  } else { // sdMetaState == 4 — DRAIN-UNTIL-QUIET: swallow every byte (over-length
+    // payload, or the dead tail of an aborted frame) without dispatching it. The
+    // top-of-function inactivity timeout (prevState==4 branch) releases us to state 0
+    // on the first byte that arrives after a >1 s quiet gap, which is then processed
+    // as a real command. No fixed count → late RF bytes can never leak into dispatch.
+    // (sdMetaStart was refreshed above, keeping the drain armed while bytes flow.)
+    //
+    // KNOWN LIMITATION (unreachable in this system): the drain release happens here in
+    // sdMetaProcess, which loop() dispatches AFTER sdPersistProcess/sdTuneProcess —
+    // both of which gate their state-0 entry on sdMetaState==0. So if the FIRST
+    // post-quiet byte were 'P' or 'T', those gates would see the not-yet-cleared
+    // sdMetaState==4, reject it, and the byte would fall through to board.processChar
+    // (which ignores P/T) and be dropped. This never happens in practice: the host
+    // sends 'P'/'T' only during setup BEFORE the 'M' frame, never after; the only
+    // post-drain bytes are the resync ('\n','?') and 'b' — none of which are P/T; and
+    // auto-resume (replaySessionFile) never issues 'M' so it never enters this drain.
+    // A full fix would hoist the inactivity reap into loop() ahead of the P/T/M
+    // dispatch — deferred (it touches the hot path and can't be bench-tested here).
   }
   return true;
 }
