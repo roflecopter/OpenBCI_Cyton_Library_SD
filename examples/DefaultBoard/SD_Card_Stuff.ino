@@ -1818,15 +1818,18 @@ void writeCache(){
           // won't see this response because we're about to reset.
           if (sdMetaState == 3) sdMetaCorrupted = true;
 
-          // Software reset. Does not return. The new boot will read EEPROM
-          // (which we have NOT disturbed) and SESSION.TXT (which we have
-          // NOT removed), see sessionActive=1, see cause=SWR, see
-          // resumeCount<MAX_RESUMES, and run the auto-resume chain.
-          executeSoftReset(0);
+          // ROLLBACK 2026-06-23: self-reset-on-recovery-exhaustion DISABLED. This
+          // executeSoftReset()→auto-resume chain was corrupting nights: the reset fires
+          // mid-write, orphaning the slot's FAT/directory entry so the whole recording
+          // reads back all-NUL (lost). Reverted to the pre-2026-05-12 behavior — fall
+          // straight through to the clean sdCardDead stop below, which preserves the
+          // partial recording up to the failure point (recoverable, like a normal slot)
+          // instead of resetting and losing everything.
+          // executeSoftReset(0);
 
-          // Unreachable, but keep the tear-down + sdCardDead=true as a
-          // belt-and-braces fallback in case executeSoftReset() ever
-          // returns (it shouldn't on PIC32MX, but defensive).
+          // Now the ACTUAL path (was the unreachable belt-and-braces fallback): clean
+          // teardown, stop writing, leave the partial file intact. SESSION.TXT is left
+          // on disk (harmless; the host's session_start overwrites it next session).
           sdCardDead = true;
           fileIsOpen = false;
           SDfileOpen = false;

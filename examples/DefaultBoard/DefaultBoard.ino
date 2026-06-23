@@ -199,11 +199,19 @@ void loop() {
   // writeCache:1780 or by closeSDfile:~1353; the writeCache reset site
   // at ~1764 needs the raise because CS is held low across its
   // multi-block context, loop() doesn't.
-  if (board.streaming && SDfileOpen) {
-    uint32_t thresh = (uint32_t)tuneCkptIntervalMs * 2;
-    if (thresh < SOFT_WDT_FLOOR_MS) thresh = SOFT_WDT_FLOOR_MS;
-    if ((uint32_t)(millis() - sdLastCkptMs) > thresh) executeSoftReset(0);
-  }
+  // ROLLBACK 2026-06-23: soft-WDT self-reset DISABLED. The mid-night
+  // executeSoftReset() here was the regression source — an MCU reset mid-SD-write
+  // corrupts the recording's FAT/directory entry, so the whole night reads back
+  // all-NUL (lost). A stalled %CKPT now simply continues (the SD-error cascade keeps
+  // retrying); a genuinely wedged card falls to sdCardDead in writeCache (clean stop,
+  // partial night preserved) rather than a self-reset. Re-enable only with the
+  // hardware-WDT + bounded-traversal design in prep.md, never this bare soft reset.
+  // if (board.streaming && SDfileOpen) {
+  //   uint32_t thresh = (uint32_t)tuneCkptIntervalMs * 2;
+  //   if (thresh < SOFT_WDT_FLOOR_MS) thresh = SOFT_WDT_FLOOR_MS;
+  //   if ((uint32_t)(millis() - sdLastCkptMs) > thresh) executeSoftReset(0);
+  // }
+  (void)sdLastCkptMs; (void)tuneCkptIntervalMs;  // still updated elsewhere; silence unused warnings
 
   // Call to wifi loop
   wifi.loop();
