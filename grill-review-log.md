@@ -59,3 +59,33 @@ the dispatch and caller-guard levels. NO open BLOCKER/MAJOR after 3 rounds.
 - The actual DEPLOY for firmware = flashing the PIC32 via pic32prog. This is a PHYSICAL, user-gated step
   (board currently powered off, SD card out; P3 verification needs the user to inject stray bytes +
   power-cycle). Flash + Act-5 verification handed to the user with exact steps; NOT done unattended.
+
+## Deploy (FLASHED) — 2026-06-24
+- pic32prog v2.1.46, STK500v2 bootloader, /dev/ttyUSB0 @ 115200, no kill-timeout.
+- build-grill/DefaultBoard.ino.hex (md5 9155fbd4667c9bc01300035184449e66, 119,808 B data).
+- Program flash: done. Verify flash: done. exit 0. ~797 B/s. NO brick.
+
+## Post-deploy verification
+- Liveness ('v'): "OpenBCI V3 8-16 channel ... Firmware: v3.1.2-freeSD $$$" — new firmware boots,
+  ADS1299 (ID 0x3E) + LIS3DH (0x33) up.
+- IDLE-state dispatch ('?'): full ADS register dump returned → new dispatchCommandByte processes
+  commands correctly in IDLE (SD card out → board idle, no replay).
+- PENDING (user-driven, needs SD card in the board): the P3 deterministic fault-injection
+  (start -a 20, inject stray F/j/s/1 mid-stream, prove B=2432000 holds + recording survives) and
+  the --stop escape round-trip. The board liveness + flash integrity are confirmed; the behavioral
+  fault-injection requires the physical SD card + a live recording.
+
+## Post-deploy verification — HARDWARE FAULT-INJECTION (PASSED) 2026-06-24
+Activity 22 added: 1000Hz / 8ch / 12H / cyton (cyton_cap_channels + emg_empty) — exhaustive stress.
+- session_start -a 22 --tune ckpt_interval_ms=5000: handshake clean, "Size 4864000 SD file OBCI_50.TXT"
+  (B=4,864,000 = correct 12H@1000Hz), "meta verified: 286 bytes", "Session started". metaArmed gate
+  accepted the legit %META-before-b. 1000Hz×8ch sustained: write 326-332us, Overruns 0.
+- Injected stray 'F' (30-min slot), 'j' (close), '1' (channel off) MID-STREAM via the dongle.
+- Sent the 8-byte escape token → ABORT CONFIRMED ($$$$$$ = closeSDfile EOT + performAbort unconditional
+  EOT), board returned to IDLE & responsive ('v' banner) — NOT wedged. closeSDfile's footer-echo on the
+  escape proves the FILE WAS STILL OPEN (the stray 'j' did NOT close it).
+- Read OBCI_50.TXT back: %META PRESENT (8ch/1000Hz JSON); 21 %CKPT lines, EVERY one B=4864000 (distinct
+  set = {4864000}); blockCounter monotonic 348->11963 with NO reset; no early footer (clean escape abort).
+  ⇒ the stray 'F' was IGNORED — BLOCK_COUNT held at 4,864,000, never the 202,000 it would have forced.
+
+VERDICT: the 06-23 stray-slot-char truncation is FIXED and verified on hardware. Flash + behavioral proof complete.
