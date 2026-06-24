@@ -1279,12 +1279,17 @@ boolean setupSDcard(char limit){
 
   // Persist session config + advance session counters BEFORE %BOOT emit so the
   // line carries the right session= value. Order matters: a true resume keeps
-  // the prior sessionSeq (chain shares one id); only a new/clean session bumps
-  // it. autoResume is set by setup() in DefaultBoard.ino before this fires.
+  // the prior sessionSeq (chain shares one id); only a new/clean session bumps it.
+  // Gate on `replayingSession` (true ONLY during replaySessionFile's byte-feed), NOT
+  // `autoResume`: autoResume is a BOOT-level flag set once by the replay and never
+  // cleared within a boot, so a HOST-initiated session after a boot-time resume would
+  // wrongly inherit the chain's resumeCount/prev and render `%BOOT resume=1 prev=…`.
+  // replayingSession distinguishes the replay's own `K` (keep the chain) from a fresh
+  // host `K` (reset → resume=0, prev=NONE). Fixes the cosmetic resume-label mislabel.
   if (fileIsOpen) {
     EEPROM.write(10, (uint8_t)limit);                            // slotChar
     EEPROM.write(11, (uint8_t)board.curSampleRate);              // ADS rate enum
-    if (!autoResume) {
+    if (!replayingSession) {
       sessionSeq++;
       EEPROM.write(5, sessionSeq & 0xFF);
       EEPROM.write(6, (sessionSeq >> 8) & 0xFF);
