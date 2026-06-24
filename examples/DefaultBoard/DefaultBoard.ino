@@ -43,6 +43,12 @@ extern uint32_t sdLastCkptMs;
 extern uint32_t tuneCkptIntervalMs;
 #define SOFT_WDT_FLOOR_MS  120000UL
 
+// Stray-RX hardening (2026-06-24) — defined in SD_Card_Stuff.ino, referenced by loop().
+extern volatile boolean abortRequested; // set by the hardened-escape matcher
+void feedEscape(uint8_t c);             // escape detector — fed every raw inbound byte
+void dispatchCommandByte(char c);          // recording-state-keyed command policy
+void performAbort();                    // safe top-level abort-close (escape stop)
+
 void setup() {
   // Capture MCU reset cause BEFORE anything that might touch RCON. Then clear
   // the sticky bits so the next reset's cause is unambiguous. NOTE: on the
@@ -108,6 +114,10 @@ void setup() {
 }
 
 void loop() {
+  // Service a hardened-escape abort at a safe top-level point (the matcher only sets the
+  // flag; closing here, between SD block writes, avoids any mid-CMD25 re-entrancy).
+  if (abortRequested) performAbort();
+
   if (board.streaming) {
     if (board.channelDataAvailable) {
       // Read from the ADS(s), store data, set channelDataAvailable flag to false
@@ -143,6 +153,9 @@ void loop() {
     // Read one char from the serial 0 port
     char newChar = board.getCharSerial0();
 
+    // Hardened-escape matcher sees EVERY raw byte first (before any parser consumes it).
+    feedEscape((uint8_t)newChar);
+
     // Dispatch chain for inbound host bytes. Order matters — each handler
     // returns true if it consumed the byte and the chain stops there.
     //   P → tune → M → SD single-char → main command processor
@@ -159,11 +172,9 @@ void loop() {
     if (!sdPersistProcess(newChar)) {
       if (!sdTuneProcess(newChar)) {
         if (!sdMetaProcess(newChar)) {
-          // Send to the sd library for processing
-          sdProcessChar(newChar);
-
-          // Send to the board library
-          board.processChar(newChar);
+          // Recording-state-keyed command policy (replaces the bare sdProcessChar +
+          // board.processChar): a stray byte can no longer mutate an open/active recording.
+          dispatchCommandByte(newChar);
         }
       }
     }
@@ -172,12 +183,8 @@ void loop() {
   if (board.hasDataSerial1()) {
     // Read one char from the serial 1 port
     char newChar = board.getCharSerial1();
-
-    // Send to the sd library for processing
-    sdProcessChar(newChar);
-
-    // Read one char and process it
-    board.processChar(newChar);
+    feedEscape((uint8_t)newChar);
+    dispatchCommandByte(newChar);
   }
 
   // Call the loop function on the board
@@ -214,18 +221,9 @@ void loop() {
   (void)sdLastCkptMs; (void)tuneCkptIntervalMs;  // still updated elsewhere; silence unused warnings
 
   // Call to wifi loop
-  wifi.loop();
+  // wifi.loop() removed (flash reclaim): WiFi shield never released; no wifi RX serviced
 
-  if (wifi.hasData()) {
-    // Read one char from the wifi shield
-    char newChar = wifi.getChar();
-
-    // Send to the sd library for processing
-    sdProcessChar(newChar);
-
-    // Send to the board library
-    board.processCharWifi(newChar);
-  }
+  // wifi RX block removed (flash reclaim): shield never present, no wifi bytes to dispatch
 
   // wifi.sentGains block removed 2026-05-15 to free 8 bytes of flash for
   // the soft-WDT SDfileOpen gate. The OpenBCI WiFi Shield was never

@@ -47,6 +47,22 @@ uint32_t sdMetaStart = 0;   // millis() when 'M' arrived (1 s timeout safety)
 uint8_t  sdPendingErrs = 0; // %E markers to emit AFTER META write completes (keeps the META line atomic)
 boolean  sdMetaCorrupted = false; // set when an UNRECOVERABLE writeCache fails during META state-3 only;
                                   // pad-flush failures are caught separately via sdErrs delta at ACK time
+
+// --- Stray-RX hardening (added 2026-06-24) ---------------------------------------
+// Root cause of the truncated/erased sleep nights: a stray byte from the on-board radio
+// (dongle unplugged) was dispatched to the command handlers mid-recording, rewriting
+// BLOCK_COUNT (slot char), closing the file ('j'), or re-entering setupSDcard. The fix is
+// a recording-state-keyed RX policy (dispatchCommandByte) + a one-shot %META arm gate +
+// a hardened escape token as the only honored stop. See prep.md / prep-review-log.md.
+boolean  metaArmed = false;          // %META completed for THIS slot → 'b' may start streaming.
+                                     // Reset in setupSDcard (fresh slot needs a fresh %META).
+volatile boolean abortRequested = false; // set by feedEscape() on a full token match; serviced
+                                     // ONLY at safe SD block boundaries (writeCache top / loop() top).
+static const uint8_t ESC_TOKEN[8] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04 };
+                                     // 8 NON-PRINTABLE, varied bytes: can't occur in a P/%META text
+                                     // payload, and a single-byte-repeat RF/UART burst can't match it.
+static uint8_t escMatchIdx = 0;      // leading token bytes matched so far
+
 // --- Recovery + checkpoint state (added 2026-05-08) ---
 // Closes a recovery hole: the original patch's skip-forward writeStart was fire-and-forget;
 // if it failed too, the multi-block context died silently and the firmware kept "writing"
@@ -285,7 +301,7 @@ boolean sdPersistProcess(char c){
     // length+payload bytes, and sdMetaProcess would never see the body it
     // expects). Gate state-0 entry on sdMetaState == 0 so we never start a
     // P transaction during an active META payload.
-    if (c == 'P' && !board.streaming && !replayingSession && sdMetaState == 0) {
+    if (c == 'P' && !board.streaming && !replayingSession && sdMetaState == 0 && !SDfileOpen) {
       // We require not-streaming to avoid contending the SD cache with active
       // multi-block writes. replayingSession guard prevents recursive write
       // from the replay path itself feeding our own bytes back through here.
@@ -575,7 +591,7 @@ boolean sdTuneProcess(char c) {
     // e.g. a {"note": "T-test"} string). Letting state-0 fire in those
     // contexts would hijack the wrong byte and break both protocols.
     if (c == 'T' && !board.streaming && !replayingSession
-        && sdMetaState == 0 && sessState == 0) {
+        && sdMetaState == 0 && sessState == 0 && !SDfileOpen) {
       resetTuneState();
       tuneState = 1;
       tuneStart = millis();
@@ -959,6 +975,12 @@ boolean replaySessionFile(){
     }
   }
   replayingSession = false;
+  // The replay is a TRUSTED source and feeds sdProcessChar/board.processChar DIRECTLY
+  // (it bypasses dispatchCommandByte), so its replayed 'b' is never subject to the
+  // metaArmed handshake gate — a resume sends no %META yet still starts. Set metaArmed
+  // here so a resumed session's state stays consistent (the slot char's setupSDcard reset
+  // it to false during the feed above).
+  metaArmed = true;
 
   // Successful replay if streaming actually started. If it didn't, the
   // resume failed somewhere during the byte feed (most likely setupSDcard
@@ -995,8 +1017,66 @@ boolean replaySessionFile(){
 }
 
 
+// Hardened escape detector — fed EVERY raw inbound byte at every ingress (incl. the
+// writeCache recovery drain) BEFORE any command parser, in every recording state. On a
+// full in-order match it ONLY sets abortRequested; the actual stop is deferred to a safe
+// SD block boundary (performAbort, from loop() top-level) so it never re-enters SD/FAT
+// code mid-CMD25 write. Mismatch restarts the match but re-checks the byte against
+// ESC_TOKEN[0] so a token-leading byte is never dropped.
+void feedEscape(uint8_t c) {
+  if (c == ESC_TOKEN[escMatchIdx]) {
+    if (++escMatchIdx >= sizeof(ESC_TOKEN)) {
+      escMatchIdx = 0;
+      abortRequested = true;
+    }
+  } else {
+    escMatchIdx = (c == ESC_TOKEN[0]) ? 1 : 0;
+  }
+}
+
+// Centralized, recording-state-keyed RX command policy. Stray radio bytes must never
+// mutate an open/active SD recording. Called from every ingress AFTER the P/T/M frame
+// processors (which own their frame bytes and are themselves gated: P/T to IDLE, M to a
+// one-shot pre-arm).
+//   RECORDING (streaming && SDfileOpen): drop all commands (escape handled via feedEscape).
+//   HANDSHAKE (SDfileOpen && !streaming): allow ONLY 'b', and only after %META armed.
+//   IDLE (no SD file): normal dispatch. A PC-only stream (streaming && !SDfileOpen) lands
+//     here too, so its 's'/stop still works.
+// (The WiFi shield was never released — wifi.hasData() is always false — so the UART
+// board.processChar path covers every live ingress; no separate WiFi branch is needed.)
+void dispatchCommandByte(char c) {
+  if (board.streaming && SDfileOpen) return;            // RECORDING — drop everything
+  if (SDfileOpen) {                                      // HANDSHAKE (implies !streaming)
+    // Only 'b', and only after %META armed. NB: this REQUIRES the host to send %META
+    // before 'b' — the stock OpenBCI GUI (slot char → 'b', no %META) can no longer start
+    // an SD recording on this build. Intentional & user-confirmed: this is a dedicated
+    // sleep-recording firmware driven solely by session_start.py (which always sends %META).
+    if (c == 'b' && metaArmed) { sdProcessChar(c); board.processChar(c); }
+    return;
+  }
+  sdProcessChar(c); board.processChar(c);               // IDLE (or PC-only stream)
+}
+
+// Single, safe abort-close path. Invoked ONLY from loop() top-level when abortRequested
+// is set, so the SD card is at a block boundary (never mid-CMD25 data phase). byteCounter
+// is zeroed first so no oblivious pCache appender can overflow; writeFooter is never
+// called on this path (a footer-less partial file is still valid); closeSDfile does the
+// BUSY-safe writeStop + close + SESSION.TXT removal (clean abort, no re-resume).
+void performAbort() {
+  byteCounter = 0;
+  if (board.streaming) board.streamStop();
+  if (SDfileOpen) SDfileOpen = closeSDfile();
+  abortRequested = false;
+  // UNCONDITIONAL ack so the host can confirm the stop even when this is an idempotent
+  // retry on an already-IDLE board (closeSDfile emits nothing when no file was open). This
+  // closes the Two-Generals hole: if the first abort's close output was dropped over RF,
+  // the host re-sends the token, performAbort runs again on the IDLE board, and this EOT
+  // still confirms the board is stopped — instead of a false "stop failed" report.
+  board.sendEOT();
+}
+
 char sdProcessChar(char character) {
-  
+
     switch (character) {
         case 'A': // 5min
         case 'S': // 15min
@@ -1007,7 +1087,12 @@ char sdProcessChar(char character) {
         case 'K': // 12hr
         case 'L': // 24hr
         case 'a': // 512 blocks
-             
+            // Layer B: reject a stray/duplicate slot char while a recording is open OR
+            // streaming (the root-cause guard). Caller-side so SDfileOpen is NOT reassigned
+            // and NO "Size N SD file" is printed → host times out → fails LOUD, never a
+            // silent destructive merge. The first legit slot char per session has
+            // SDfileOpen==false; the trusted boot-replay path also runs with it false.
+            if (board.streaming || SDfileOpen) break;
             fileSize = character;
             SDfileOpen = setupSDcard(character);
             break;
@@ -1064,6 +1149,10 @@ boolean setupSDcard(char limit){
   // same MCU uptime leave stale resumeCount values that could trip the
   // cap on a later night.
   firstCkptResetDone = false;
+
+  // A fresh slot must be re-armed by its own %META before 'b' is honored
+  // (blocks a stray 'b' from starting a recording with no metadata).
+  metaArmed = false;
 
   if(!cardInit){
       if(!card.init(SPI_FULL_SPEED, SD_SS)) {
@@ -1419,7 +1508,9 @@ boolean sdMetaProcess(char c) {
     // prevState == 4: fall through with sdMetaState now 0 → this post-quiet byte is real
   }
   if (sdMetaState == 0) {
-    if (c == 'M' && SDfileOpen && !board.streaming) {
+    // One %META per slot: gate on !metaArmed so a stray 'M' AFTER the legit %META can't
+    // re-enter the frame parser and swallow the following 'b'.
+    if (c == 'M' && SDfileOpen && !board.streaming && !metaArmed) {
       sdMetaState = 1;
       sdMetaCount = 0;
       sdMetaSum   = 0;
@@ -1438,8 +1529,10 @@ boolean sdMetaProcess(char c) {
   } else if (sdMetaState == 2) {
     sdMetaCount |= ((uint16_t)(uint8_t)c) << 8;
     if (sdMetaCount == 0) {
-      // empty payload — host explicitly said zero bytes; ACK and idle
+      // empty payload — host explicitly said zero bytes; ACK and idle. Still a completed
+      // %META handshake → arm 'b' (host that legitimately ships no metadata can start).
       sdMetaState = 0;
+      metaArmed = true;
       if (!board.streaming) { Serial0.println("META OK 0 0"); board.sendEOT(); }
     } else if (sdMetaCount > 1024) {
       // bad length: drain-until-quiet (no fixed count) so a host that ships MORE than
@@ -1491,6 +1584,8 @@ boolean sdMetaProcess(char c) {
         writeCache();
       }
       sdMetaState = 0;   // leave state 3 only AFTER every writeCache() above
+      // %META landed for this slot → 'b' may now start streaming (premature-'b' guard).
+      if (!sdMetaCorrupted) metaArmed = true;
       if (!board.streaming) {
         // D3b — verdict on sdMetaCorrupted ALONE. The old `sdErrs > before` check
         // false-FAILed when a writeData hiccup was recovered by the same-block
@@ -1563,9 +1658,10 @@ void writeDataToSDcard(byte sampleNumber){
     // was active. Older parsers tolerant of unknown k=v fields will just
     // skip the new field; readers that want it can pull `T=([0-9a-f]+)`.
     int n = snprintf(tmp, sizeof(tmp),
-                     "%%CKPT t=%lu b=%d e=%lu r=%lu n=%lu o=%lu x=%lu T=%08lx\n",
+                     "%%CKPT t=%lu b=%d B=%lu e=%lu r=%lu n=%lu o=%lu x=%lu T=%08lx\n",
                      (unsigned long)millis(),
                      blockCounter,
+                     (unsigned long)BLOCK_COUNT,
                      (unsigned long)sdErrs,
                      (unsigned long)sdRetries,
                      (unsigned long)sdReinits,
@@ -1657,6 +1753,15 @@ void writeDataToSDcard(byte sampleNumber){
 
 
 void writeCache(){
+
+    // Escape-abort requested (hardened token matched). Do NOT close here — that would
+    // issue CMD12/FAT ops mid-CMD25 multi-block write (re-entrancy/corruption). Just zero
+    // the cache (like the sdCardDead path, so any oblivious pCache appender is safe) and
+    // return; loop() top-level runs performAbort() at a safe block boundary.
+    if (abortRequested) {
+      byteCounter = 0;
+      return;
+    }
 
     // sdCardDead: skip-forward retry + half-speed re-init both failed earlier.
     // The card is hard-stuck. Drop further sample data on the floor and tell
@@ -1767,7 +1872,16 @@ void writeCache(){
               uint32_t chunkEnd = millis() + tuneExtRecoveryChunkMs;
               while ((int32_t)(chunkEnd - millis()) > 0) {
                 delay(1);
-                while (board.hasDataSerial0()) (void)board.getCharSerial0();
+                // Drain host serial during the stall, feeding every byte to the escape
+                // matcher FIRST so the hardened stop reaches the user mid-stall — across
+                // ALL active transports (Serial0 + Serial1), not just the primary radio.
+                while (board.hasDataSerial0()) feedEscape((uint8_t)board.getCharSerial0());
+                while (board.hasDataSerial1()) feedEscape((uint8_t)board.getCharSerial1());
+                // If the escape matched during the stall, bail to a safe state NOW rather
+                // than waiting out the recovery window: zero the cache (no oblivious
+                // appender can overflow) and release SPI; loop() top-level then runs
+                // performAbort() to streamStop + close + remove SESSION.TXT.
+                if (abortRequested) { byteCounter = 0; board.csHigh(SD_SS); return; }
               }
               // Use the dedicated extended-window counter (sdExtRetries)
               // rather than sdReinits so the morning user can distinguish
@@ -1834,6 +1948,10 @@ void writeCache(){
           fileIsOpen = false;
           SDfileOpen = false;
           board.sdFileOpen = false;
+          // Reset the cache index on this fatal return too: a caller still mid
+          // pCache[byteCounter++] loop (EMIT macros / %META replay) when the SD write
+          // failed would otherwise walk past pCache[512]. Mirrors the sdCardDead return.
+          byteCounter = 0;
           return;
         }
         // If this happened mid-META payload, flag corruption so the host gets
