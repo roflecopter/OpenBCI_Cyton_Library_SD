@@ -716,6 +716,58 @@ void applyTuneTextLine(const uint8_t* buf, uint16_t len) {
 // because the replay's `K` command will open a new multi-block recording
 // file on the same SdVolume — keeping SESSION.TXT's handle open during that
 // would contend the SD library's single-cached-block model.
+// --- Post-reset SD bus recovery (added 2026-06-28) -------------------------------
+// An external power/connection glitch (the JST battery contact under movement) can
+// reset the MCU mid-CMD25 multi-block write, leaving the SD card stuck waiting for
+// the rest of a data block. card.init()'s CS-high idle clocks + CMD0 do NOT abort an
+// in-progress CMD25, so on the boot-resume createContiguous/erase/writeStart fail and
+// the next slot is created 0-byte (with no REPLAYFL). A clean power-cycle de-powers
+// the card so cold init works — that path is the only one the bench ever tested, which
+// is why resume "worked before" but the overnight glitch path didn't.
+//
+// This issues the correct SPI-mode abort BEFORE card.init: finish any partial data
+// block, wait out programming-busy, send the stop-tran token 0xFD, then a best-effort
+// CMD12 (for a card wedged in a CMD18 multi-block READ), leaving the card idle so the
+// following card.init() (CMD0/ACMD41) succeeds and recording resumes into a fresh slot.
+//
+// All I/O goes through the already-initialized HARDWARE DSPI (board.spi) — board.begin()
+// runs spi.begin() before replaySessionFile(), and the SD library fork (OBCI32_SD) itself
+// talks to the card this way (spiRec/spiSend -> _spi->transfer). So there is NO bit-bang,
+// NO PPS unmap, NO pin-direction work: board.csLow/csHigh own SD_SS, board.spi clocks the
+// shared bus. Every wait is millis()-bounded (rollover-safe) so a dead card can't hang the
+// boot — the soft-WDT is disabled, so an unbounded spin here would brick the night.
+// Architecture confirmed by the Codex+Gemini panel (grill-review-log.md, consult 1).
+#define SD_RECOVER_BUSY_MS   2000UL   // > SD_WRITE_TIMEOUT (1500) so a programming card isn't misread as dead
+// Resume-only stabilization pause before the first resume FAT write (createContiguous). Lets the
+// power rail settle after an external glitch so the FAT mutation starts on stable power — a bounce
+// DURING the delay just resets the MCU again before any FAT write, instead of corrupting it.
+#define SD_RESUME_STABILIZE_MS  2500UL
+static void sdBusRecover(){
+  board.csLow(SD_SS);                          // MODE0, 20 MHz, CS low — select the card
+  // 1. Finish any partial CMD25 data block: clock a full packet worth (512 data + 2 CRC + margin)
+  //    so a card stuck mid-payload reaches its data-response/token-wait state. On an idle/healthy
+  //    card these are just ignored 0xFF clocks (harmless).
+  for (uint16_t i = 0; i < 520; i++) board.spi.transfer(0xFF);   // 512 + 2 + 6 margin
+  // 2. Wait out programming-BUSY (card holds MISO low -> transfer returns 0x00) BEFORE the stop
+  //    token: a 0xFD sent during BUSY is ignored. Clock 0xFF continuously while polling. Bounded.
+  uint32_t t0 = millis();
+  while ((uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && board.spi.transfer(0xFF) != 0xFF) {}
+  // 3. Stop-tran token ends the multi-block write; wait out its programming-BUSY.
+  board.spi.transfer(0xFD);
+  t0 = millis();
+  while ((uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && board.spi.transfer(0xFF) != 0xFF) {}
+  // NOTE: 0xFD is the correct AND sufficient stop for an SPI multi-block WRITE (CMD25), which is the
+  // only multi-block transfer this firmware ever issues during recording — so the wedge is always a
+  // stuck CMD25. A CMD12 (which aborts a multi-block READ, CMD18) was considered and intentionally
+  // OMITTED: this firmware never issues CMD18 (SESSION.TXT and FAT/dir reads are single-block CMD17
+  // that complete before recovery runs), so CMD12 would guard an impossible state — and the flash
+  // budget (~4 KB) is better spent elsewhere. Both review models confirmed CMD12 is not required for
+  // CMD25 recovery. If a future change adds multi-block reads, restore a best-effort CMD12 here.
+  // 4. Release the bus: CS high + trailing idle clocks.
+  board.csHigh(SD_SS);
+  for (uint8_t i = 0; i < 16; i++) board.spi.transfer(0xFF);
+}
+
 // Best-effort SD writer for a tiny REPLAYFL.TXT forensic file. Called from
 // every failure return in replaySessionFile() with a code matching the
 // failure point — gives the morning user a way to know WHICH replay step
@@ -755,7 +807,13 @@ static void writeReplayFail(uint8_t code){
   // If init/volume.init() truly fail (card physically dead), we silently
   // return — the LED is still the user's primary indicator. Same fail-mode
   // as before, just less likely.
-  if (!card.init(SPI_FULL_SPEED, SD_SS)) { cardInit = false; return; }
+  // Try a normal init first; if it fails the card may be wedged mid-CMD25 from the glitch reset,
+  // so run the SPI-mode bus recovery and retry (same init-first/recover/retry as replaySessionFile).
+  // Without this a wedged card fails card.init AND the REPLAYFL write, leaving only the LED.
+  if (!card.init(SPI_FULL_SPEED, SD_SS)) {
+    sdBusRecover();
+    if (!card.init(SPI_FULL_SPEED, SD_SS)) { cardInit = false; return; }
+  }
   if (!volume.init(card)) { cardInit = false; return; }
   cardInit = true;  // refresh state flag — caller may have stale value
 
@@ -765,12 +823,33 @@ static void writeReplayFail(uint8_t code){
   // (point root at the volume's root cluster) and ignore the return —
   // root is valid either way. Matches setupSDcard's pattern at line 249.
   root.openRoot(volume);
-  SdFile::remove(&root, "REPLAYFL.TXT");
+  // Non-destructive + one-shot, but self-healing: keep a VALID prior REPLAYFL.TXT — an earlier failure
+  // this boot, or a prior un-ingested night (collect_bci unlinks it on ingest each morning, so it can't
+  // persist) — and skip, avoiding a needless FAT mutation in the post-fault window. A marker is "valid"
+  // only if it begins with the "code=" prefix (every real marker does, written left-to-right). A stub
+  // from a write truncated by a 2nd reset (e.g. "co", or zero bytes) or any garbage FAILS the prefix
+  // check and is REMOVED + (re)written, so a later genuine failure is never silenced by a useless stub.
   SdFile rf;
-  if (!rf.open(&root, "REPLAYFL.TXT", O_CREAT | O_WRITE)) return;
+  if (rf.open(&root, "REPLAYFL.TXT", O_READ)) {
+    char prev[40];
+    int got = rf.read(prev, sizeof(prev));
+    rf.close();
+    // Trust an existing marker ONLY if it is a COMPLETE one: starts with "code=" AND ends with '\n'
+    // (every real marker is "code=...\n"). A bare "code=" stub or torn garbage from a write cut short
+    // by a 2nd reset has no trailing '\n' → rejected, removed, and rewritten, so a later genuine
+    // failure is never silenced by a useless stub.
+    if (got >= 6 && memcmp(prev, "code=", 5) == 0 &&
+        prev[5] >= '0' && prev[5] <= '9' && prev[got - 1] == '\n') return;  // complete marker → one-shot
+    SdFile::remove(&root, "REPLAYFL.TXT");                    // stub/garbage → replace it below
+  }
+  // O_TRUNC guarantees a clean slate even if the remove above silently failed (so a longer old
+  // payload can't leave a garbage tail under a shorter new one).
+  if (!rf.open(&root, "REPLAYFL.TXT", O_CREAT | O_WRITE | O_TRUNC)) return;
   char b[40];
   int n = snprintf(b, sizeof(b), "code=%u t=%lums\n",
                    (unsigned)code, (unsigned long)millis());
+  if (n > (int)sizeof(b) - 1) n = sizeof(b) - 1;  // clamp to formatted chars only (snprintf returns
+                                                  // INTENDED length; never write past b or the '\0')
   if (n > 0) rf.write((const uint8_t*)b, n);
   rf.sync();
   rf.close();
@@ -803,8 +882,17 @@ boolean replaySessionFile(){
     return false;
   }
 
+  // Try a NORMAL init first. If it FAILS, the card may be stuck mid-CMD25 from an external glitch
+  // reset (card.init's CS-high idle clocks + CMD0 do NOT abort an in-progress CMD25), so run the
+  // SPI-mode bus recovery and retry init. On a normal/cold card the first init succeeds and recovery
+  // NEVER runs -> a no-reset night is byte-for-byte unchanged, and a healthy card is never clocked at
+  // full speed before its own low-speed identification inside card.init().
   if (!cardInit) {
     if (card.init(SPI_FULL_SPEED, SD_SS)) cardInit = volume.init(card);
+    if (!cardInit) {
+      sdBusRecover();                                              // un-wedge a stuck CMD25
+      if (card.init(SPI_FULL_SPEED, SD_SS)) cardInit = volume.init(card);
+    }
   }
   if (!cardInit) {
     // Can't write REPLAYFL.TXT — SD itself is broken. LED double-flash +
@@ -933,6 +1021,14 @@ boolean replaySessionFile(){
   autoResume         = true;
   replayingSession   = true;
   firstCkptResetDone = false;
+
+  // Resume-only stabilization pause: SESSION.TXT is validated (header/footer/pre-scan passed) and we
+  // are about to feed the body whose `K` command does the first resume FAT write (createContiguous).
+  // Wait for the power rail to settle after the glitch that reset us, so that FAT write starts on
+  // stable power. This is reached ONLY on a real resume — a normal bedtime boot has no SESSION.TXT
+  // and returned earlier — so a no-reset night is byte-for-byte unchanged.
+  delay(SD_RESUME_STABILIZE_MS);
+
   uint8_t* feed = buf + sizeof(hdr) - 1;
   // Feed loop is LINE-AWARE so `%TUNE k=v ...` lines can be parsed BEFORE
   // the rest of the body reaches dispatch. Dispatching the raw bytes of
@@ -1140,6 +1236,25 @@ char sdProcessChar(char character) {
 }
 
 
+// Fail-fast cleanup for every setupSDcard allocation failure (createContiguous / contiguousRange /
+// erase / writeStart): release the (possibly open) file handle, notify the host, raise CS to release
+// the bus, and return fileIsOpen — which is ALWAYS false on a failure path. Centralising this stops
+// the old fall-through where a failed create/range still ran erase()/writeStart() with a stale block
+// range, and a failed erase/writeStart leaked the open contiguous handle. openfile.close() and
+// csHigh() are safe to call even if the file isn't open / CS is already high (idempotent).
+static boolean setupSDfail(){
+  openfile.close();
+  // Remove any slot left at currentFileName. After a SUCCESSFUL createContiguous, a later
+  // contiguousRange/erase/writeStart failure would otherwise ORPHAN a full-size preallocated file of
+  // unwritten sectors — which the remove-guard would then treat as real data (fileSize>0) and
+  // collection could ingest as a garbage recording. On the pre-create failure path the name was
+  // already free/removed, so this is a harmless no-op.
+  SdFile::remove(&root, currentFileName);
+  if(!board.streaming) board.sendEOT();
+  board.csHigh(SD_SS);
+  return fileIsOpen;
+}
+
 boolean setupSDcard(char limit){
 
   // Every fresh setupSDcard call starts a new session — re-arm the
@@ -1155,23 +1270,17 @@ boolean setupSDcard(char limit){
   metaArmed = false;
 
   if(!cardInit){
-      if(!card.init(SPI_FULL_SPEED, SD_SS)) {
-        if(!board.streaming) {
-          Serial0.println("initialization failed. Things to check:");
-          Serial0.println("* is a card is inserted?");
-        }
-      //    card.init(SPI_FULL_SPEED, SD_SS);
-      } else {
-        if(!board.streaming) {
-          Serial0.println("Wiring and sdcard is correct.");
-        }
+      // Diagnostic Serial0 strings removed here to reclaim flash for sdBusRecover (this is a
+      // headless sleep recorder — LED indications + REPLAYFL are the user-facing signals).
+      if(card.init(SPI_FULL_SPEED, SD_SS)) {
         cardInit = true;
+      } else {
+        // FAIL-FAST: init failed → do NOT call volume.init / touch FAT on a dead transport.
+        if(!board.streaming) board.sendEOT();
+        return fileIsOpen;
       }
-      if (!volume.init(card)) { // Now we will try to open the 'volume'/'partition' - it should be FAT16 or FAT32
-        if(!board.streaming) {
-          Serial0.println("Could not find FAT16/FAT32 partition. Make sure you've formatted the card");
-          board.sendEOT();
-        }
+      if (!volume.init(card)) { // open the 'volume'/'partition' — FAT16 or FAT32
+        if(!board.streaming) board.sendEOT();
         return fileIsOpen;
       }
    }
@@ -1218,49 +1327,66 @@ boolean setupSDcard(char limit){
 
   incrementFileCounter();
   openvol = root.openRoot(volume);
+
+  // Remove-guard: NEVER destroy a non-zero (real-data) file via a filename-counter collision
+  // (the counter wraps 00..FF and EEPROM can desync from what's on the card). If the target name
+  // already holds data, advance to a free/0-byte slot; a 0-byte collision MAY be overwritten
+  // (the audit trail of empty slots is best-effort). If a bounded scan finds no safe slot, FAIL-FAST
+  // rather than blindly remove real data — better to lose this resume slot than a prior night.
+  {
+    SdFile probe;
+    int attempts = 0;
+    for (;;) {
+      if (!probe.open(&root, currentFileName, O_READ)) break;      // name is free -> use it
+      uint32_t fsz = probe.fileSize();
+      probe.close();                                               // release probe handle (no leak)
+      if (fsz == 0) break;                                         // 0-byte collision -> reuse it
+      incrementFileCounter();                                      // occupied by real data -> next name
+      // HARD NUMERIC BOUND (covers the full 255-name OBCI_NN namespace + margin), decoupled from the
+      // filename cycle so it ALWAYS terminates regardless of incrementFileCounter's wrap quirks —
+      // critical because the soft-WDT is DISABLED, so an unbounded scan would hang the boot and brick
+      // the night. Reaching it means every legal slot holds real data -> fail-fast, never overwrite.
+      if (++attempts >= 256) {
+        if(!board.streaming) board.sendEOT();
+        board.csHigh(SD_SS);
+        return fileIsOpen;
+      }
+    }
+  }
+
   openfile.remove(root, currentFileName); // if the file is over-writing, let it!
 
+  // Every allocation step below FAILS FAST via setupSDfail() (closes the file handle + releases the
+  // bus + notifies the host, returns fileIsOpen=false). Critically this stops a createContiguous/
+  // contiguousRange failure from falling through into erase()/writeStart() with a STALE bgnBlock/
+  // endBlock (which could erase/write the WRONG blocks), and stops an erase/writeStart failure from
+  // leaking the open contiguous handle. On any failure the caller sees no open file and writes REPLAYFL.
   if (!openfile.createContiguous(root, currentFileName, BLOCK_COUNT*512UL)) {
-    if(!board.streaming) {
-      Serial0.print("createfdContiguous fail");
-      LED_SD_Status_Indication(ERROR_BLINKS, 500, ERROR_LED);
-      
-    }
-    cardInit = false;
-  }//else{Serial0.print("got contiguous file...");delay(1);}
+    if(!board.streaming) LED_SD_Status_Indication(ERROR_BLINKS, 500, ERROR_LED);
+    cardInit = false; return setupSDfail();
+  }
   // get the location of the file's blocks
   if (!openfile.contiguousRange(&bgnBlock, &endBlock)) {
-    if(!board.streaming) {
-      Serial0.print("get contiguousRange fail");
-      LED_SD_Status_Indication(ERROR_BLINKS, 500, ERROR_LED);
-   
-    }
-    cardInit = false;
-  }//else{Serial0.print("got file range...");delay(1);}
-  
+    if(!board.streaming) LED_SD_Status_Indication(ERROR_BLINKS, 500, ERROR_LED);
+    cardInit = false; return setupSDfail();
+  }
+
   // grab the Cache
   pCache = (uint8_t*)volume.cacheClear();
-  
+
   // tell card to setup for multiple block write with pre-erase
   if (!card.erase(bgnBlock, endBlock)){
-    if(!board.streaming) {
-      Serial0.println("erase block fail");
-      LED_SD_Status_Indication(ERROR_BLINKS, 500, ERROR_LED);
-    }
-    cardInit = false;
-  }//else{Serial0.print("erased...");delay(1);}
- 
-  if (!card.writeStart(bgnBlock, BLOCK_COUNT)){
-    if(!board.streaming) {
-      Serial0.println("writeStart fail");
-      LED_SD_Status_Indication(ERROR_BLINKS, 500, ERROR_LED);
-    }
-    cardInit = false;
-  } else{
-    fileIsOpen = true;
-    delay(1);
+    if(!board.streaming) LED_SD_Status_Indication(ERROR_BLINKS, 500, ERROR_LED);
+    cardInit = false; return setupSDfail();
   }
-  board.csHigh(SD_SS);  // release the spi
+
+  if (!card.writeStart(bgnBlock, BLOCK_COUNT)){
+    if(!board.streaming) LED_SD_Status_Indication(ERROR_BLINKS, 500, ERROR_LED);
+    cardInit = false; return setupSDfail();
+  }
+  fileIsOpen = true;
+  delay(1);
+  board.csHigh(SD_SS);  // release the spi — writeCache re-selects per block
   
   // initialize write-time overrun error counter and min/max wirte time benchmarks
   overruns = 0;
@@ -1388,14 +1514,8 @@ boolean setupSDcard(char limit){
     #undef EMIT_BYTE
   }
 
-  if(fileIsOpen == true){  // send corresponding file name to controlling program
-    if(!board.streaming) {
-      Serial0.print("Size ");
-      Serial0.print(BLOCK_COUNT);
-      Serial0.print(" SD file ");
-      Serial0.println(currentFileName);
-      LED_SD_Status_Indication(OK_BLINKS, 250, OK_LED);
-    }
+  if(fileIsOpen == true){  // slot opened OK — LED is the headless signal (Serial0 size print trimmed for flash)
+    if(!board.streaming) LED_SD_Status_Indication(OK_BLINKS, 250, OK_LED);
   }
   if(!board.streaming) {
     board.sendEOT();

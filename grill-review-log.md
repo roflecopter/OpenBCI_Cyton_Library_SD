@@ -89,3 +89,192 @@ Activity 22 added: 1000Hz / 8ch / 12H / cyton (cyton_cap_channels + emg_empty) �
   ⇒ the stray 'F' was IGNORED — BLOCK_COUNT held at 4,864,000, never the 202,000 it would have forced.
 
 VERDICT: the 06-23 stray-slot-char truncation is FIXED and verified on hardware. Flash + behavioral proof complete.
+
+---
+
+# /grill: post-reset SD auto-resume recovery (2026-06-28, branch grill/cyton-sd-recover)
+
+Implements prep.md "robust post-reset SD auto-resume". Builds on the rx-hardening work above.
+
+## Implementation consults
+
+### Consult 1 (Act 1) — ARCHITECTURE FORK: hardware-DSPI vs the prep's bit-bang  [Codex + Gemini]
+**Discovery during implementation:** the prep (7 rounds) assumed the SD card is driven by the STOCK
+chipKIT SD library's SOFTWARE BIT-BANG (PORT-register toggling of prtSCK/prtSDO/prtSDI), and built an
+elaborate sdBusRecover around disabling DSPI + clearing the MOSI/SDO1 PPS map (RPxnR=0) + LAT-before-
+TRIS + ISR-masking. Reading the ACTUAL source contradicts that premise:
+- The firmware uses a local fork **OBCI32_SD** (~/Arduino/libraries/OpenBCI_32bit_SD), constructed
+  `Sd2Card card(&board.spi, SD_SS)`. In that fork `spiRec()/spiSend()` route through `_spi->transfer()`
+  (HARDWARE DSPI0) whenever `_spi` is non-null — which it is. The IOPORT_G bit-bang branch is DEAD code.
+- `board.begin()` (DefaultBoard.ino:84) runs BEFORE `replaySessionFile()` (:113) and calls
+  `spi.begin(); spi.setMode(DSPI_MODE0)` — the DSPI0 is fully initialized before recovery runs. It also
+  parks BOARD_ADS + LIS3DH_SS chip-selects HIGH. ADS+SD share DSPI0 (separate CS GPIOs 8 vs 2).
+- `board.csLow(SD_SS)/csHigh(SD_SS)` (public) set MODE0/20MHz + CS; `board.spi.transfer()` is public;
+  `waitNotBusy()` already implements the bounded MISO-high busy-wait. The ADS_DRDY ISR only reads PORTA
+  and sets a flag (no SPI), so ISR-masking is moot.
+
+**Proposed correction:** do the CMD25/CMD18 abort over the already-initialized HARDWARE DSPI
+(board.csLow(SD_SS) → drain >=514x 0xFF → bounded busy-wait → 0xFD → busy-wait → best-effort CMD12 →
+csHigh + trailing clocks), entirely in the .ino, NO bit-bang/PPS/LAT-TRIS/ISR-mask.
+
+**Both models: CONFIRMED — ship the hardware-DSPI sdBusRecover, drop ALL bit-bang/PPS machinery.**
+- Codex: "the bit-bang/PPS machinery is unnecessary and inapplicable... use the hardware-DSPI recovery.
+  The original bit-bang/PPS plan was based on the wrong SD transport for this source tree." Confirmed the
+  busy-wait `!=0xFF` test, the 520-byte drain (512+2+margin), CMD12 framing + R1 stuff-byte skip, the 2s
+  bound (> SD_WRITE_TIMEOUT 1500ms). Nit: order the while as `(millis()-t0)<BOUND && transfer(0xFF)!=0xFF`
+  to avoid one extra transfer after timeout (harmless, adopted).
+- Gemini: "the previous plan's core premise was fundamentally flawed for this fork... textbook SD protocol
+  recovery state machine... ship your proposed sdBusRecover() in the .ino. Rip out all the PPS/LAT/TRIS
+  bit-bang complexity." Validated busy-wait, bounded loops (rollover-safe), CMD12 framing, R1 16-byte scan,
+  trailing clocks.
+- **KEEP (both):** SD_SS park HIGH before board.begin() (ADS+SD share DSPI0); force cardInit=false + re-run
+  card.init/volume.init; resume-only stabilization delay; non-destructive REPLAYFL; setupSDcard fail-fast +
+  remove-guard. **DROP (both):** DSPI disable/reacquire, PPS unmap, GPIO bit-bang, LAT/TRIS ordering, DRDY
+  ISR masking.
+
+Resolution: implement the hardware-DSPI sdBusRecover (Codex's term-ordering nit adopted; 520 = 512+2+6
+margin). All other prep decisions (5,6,7,8 + the pre-begin park) carry over unchanged.
+
+## Review round 1 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
+### Codex findings
+1. [MAJOR] sdBusRecover clocks a pre-init card at 20MHz (board.csLow sets 20MHz) — violates SD
+   identification timing / changes normal boot. Fix: init-safe rate, or init-first then recover-on-fail.
+2. [MAJOR] setupSDcard still falls through after card.init() failure into volume.init on a dead transport.
+   Fix: on card.init fail, sendEOT + return (fail-fast).
+3. [MAJOR] An existing ZERO-BYTE REPLAYFL.TXT suppresses all future failure markers (one-shot guard
+   treats any readable file as valid). Fix: only skip a validated non-zero marker; replace zero-byte.
+### Gemini findings
+1. [BLOCKER] probe.open(root,...) API mismatch — claims compilation failure (expects pointer).
+### Resolution (orchestrator)
+- Codex#1 → ACCEPTED, via a BETTER restructure: init-first, and ONLY if card.init fails run sdBusRecover
+  + retry init (in both replaySessionFile and writeReplayFail). This makes a normal/cold boot
+  byte-identical (recovery never runs unless the card is actually wedged) and never clocks a healthy card
+  at 20MHz before card.init's own low-speed identification. Strictly better than the unconditional recover.
+- Codex#2 → ACCEPTED: setupSDcard init block now `else { sendEOT; return fileIsOpen; }` on card.init fail.
+- Codex#3 → ACCEPTED: writeReplayFail now reads the existing REPLAYFL's fileSize — skip only if >0
+  (valid prior marker); an absent OR zero-byte/partial marker is (re)written so a botched stub can't
+  silence later failures.
+- Gemini#1 → REJECTED as stated (NOT a compilation failure — the build links at 118752 bytes, and
+  SdFat.h has the `open(SdFile& dirFile, const char*, uint8_t)` reference overload at line 329). BUT
+  adopted the `&root` form anyway for consistency with writeReplayFail (rf.open(&root,...)). Harmless.
+- Flash: round-1 fixes re-overflowed by ~120B; trimmed more dead !board.streaming diagnostics in
+  setupSDcard (erase/writeStart fail strings, the "Size N SD file NAME" success print). Now 118752/122880.
+### Tests after this round
+arduino-cli compile chipKIT:pic32:openbci → links, 118752 bytes (96%), RAM 11848 (36%) unchanged. .hex produced.
+### Decision-9 verification (collect_bci tolerance)
+Confirmed by the existing footerless workflow: the user powers off (no --stop), so EVERY night's prior
+slot already ends in an undefined tail after the last good sample and collect_bci processes it fine.
+The drain just makes the interrupted block deterministic (partial+0xFF) vs stale — same junk-tail class,
+no new data-integrity risk.
+
+## Review round 2 — Codex: CHANGES_REQUESTED | Gemini: APPROVED (1 MINOR)
+### Codex findings
+1. [MAJOR] REPLAYFL self-heal trusts ANY nonzero stub (prevSz>0) — a write truncated by a 2nd reset
+   leaves a 1-byte/partial file that suppresses all later markers. Fix: validate marker shape (prefix
+   + newline + min length) or rewrite unless it parses.
+2. [MAJOR] setupSDcard still falls through after erase()/writeStart() failure — leaks the open
+   contiguous openfile handle + continues after a failed erase. Fix: fail-fast cleanup on both.
+### Gemini findings
+APPROVED. Validated boundedness, init-first/recover/retry, fail-fast, remove-guard, REPLAYFL, SD_SS park.
+1. [MINOR] snprintf returns INTENDED length — if the format ever exceeded b[40], rf.write(b,n) reads
+   past the buffer. Caps at 26 chars today so can't trigger, but fragile. Fix: clamp n to sizeof(b).
+### Resolution (orchestrator)
+- Codex#1 → ACCEPTED: REPLAYFL now reads the first 5 bytes and trusts the existing marker only if they
+  == "code=" (every real marker, complete or partial-but-readable, starts with it; written L-to-R). A
+  stub/garbage fails the prefix → SdFile::remove + (re)write. Robust against truncation-by-2nd-reset.
+- Codex#2 → ACCEPTED: factored a `setupSDfail()` helper (openfile.close + sendEOT + csHigh + return
+  fileIsOpen) and routed ALL FOUR allocation failures (createContiguous/contiguousRange/erase/
+  writeStart) through it — no fall-through, no handle leak. DRY (also saved flash vs inline copies).
+- Gemini MINOR → ACCEPTED: `if (n > (int)sizeof(b)) n = sizeof(b);` before rf.write.
+- FLASH: the round-2 fixes re-overflowed by ~56B and the remaining Serial0 strings are host-protocol
+  ACKs (META OK/FAIL, TUNE/PERSIST FAIL) that must NOT be trimmed. Instead DROPPED the CMD12 step from
+  sdBusRecover: this firmware only issues multi-block WRITES (CMD25) during recording, so the wedge is
+  always a stuck CMD25, for which 0xFD is the correct+sufficient stop (both models confirmed CMD12 is
+  not required for CMD25). CMD12 only aborts a multi-block READ (CMD18), which this firmware never
+  issues — so it guarded an impossible state. Documented inline with a restore note. Now 118676/122880.
+### Tests after this round
+arduino-cli compile → links, 118676 bytes (96%), RAM 11848 (36%) unchanged. .hex produced.
+
+## Review round 3 — Codex: CHANGES_REQUESTED | Gemini: APPROVED (2 MINOR)
+### Codex findings
+1. [MAJOR] setupSDfail leaves an orphaned FULL-SIZE preallocated file after a post-createContiguous
+   failure (contiguousRange/erase/writeStart) — only closes, doesn't remove. The remove-guard later
+   treats it as real data; collection could ingest garbage. Fix: remove currentFileName in cleanup.
+2. [MAJOR] REPLAYFL prefix-only accepts a bare "code=" stub → future markers suppressed. Fix: validate
+   a complete marker (prefix + ... + newline).
+3. [MAJOR] remove-guard 32-cap can fail when free names exist past 32 occupied slots. Fix: scan full
+   256-name namespace / until counter wraps to start.
+4. [MINOR] SD_SS pinMode(OUTPUT) before digitalWrite(HIGH) can briefly drive a power-up-low latch
+   (select card). Fix: latch high first, then OUTPUT.
+### Gemini findings
+APPROVED. Validated setupSDfail idempotency, REPLAYFL purge, sdBusRecover bus-abort + boundedness,
+init-first/recover/retry, boot safety, SD_SS park.
+1. [MINOR] snprintf clamp should be sizeof(b)-1 (else a truncated write would emit the '\0'). 
+2. [MINOR] add O_TRUNC to the REPLAYFL recreate (clean slate if remove silently failed).
+### Resolution (orchestrator) — ALL accepted
+- Codex#1 → setupSDfail now `SdFile::remove(&root, currentFileName)` after close — removes the orphaned
+  full-size slot on any post-create failure; harmless no-op on the pre-create path (name already free).
+- Codex#2 → REPLAYFL now reads up to 40 bytes and trusts the marker ONLY if it starts with "code=" AND
+  ends with '\n' (a complete "code=...\n"); a stub/torn-garbage is removed + rewritten.
+- Codex#3 → remove-guard rewritten: scan until a free/0-byte name is found OR the counter wraps back to
+  the starting candidate (all 255 legal names hold real data → fail-fast). No arbitrary cap. Typical
+  case is 1 iteration (the just-incremented next name is free).
+- Codex#4 → DefaultBoard.ino: digitalWrite(SD_SS,HIGH) BEFORE pinMode(SD_SS,OUTPUT).
+- Gemini#1 → snprintf clamp to sizeof(b)-1. Gemini#2 → O_TRUNC added (verified defined at SdFat.h:70).
+### Tests after this round
+arduino-cli compile → links, 118744 bytes (96%), RAM 11848 (36%) unchanged. .hex produced.
+
+## Review round 4 (backstop) — Codex: APPROVED (2 MINOR) | Gemini: CHANGES_REQUESTED (1 BLOCKER)
+### Codex findings
+APPROVED. 1.[MINOR] REPLAYFL validator looser than format (would keep "code=\n"/"code=garbage\n") — self-
+rated non-blocking (the formatter can't naturally produce that). 2.[MINOR] remove-guard treats any
+probe.open()==false as "free", collapsing media/FAT read errors into not-found — self-rated non-blocking
+(a real SD fault fails the subsequent create too).
+### Gemini findings
+1. [BLOCKER] remove-guard infinite loop on a start of file "00": incrementFileCounter wraps FF→01
+   (skipping 00), so a wrap-detection keyed on the start "00" never re-matches → infinite loop → hang →
+   brick (WDT off). Fix: decouple termination from the filename wrap; use a numeric attempts<256 bound.
+### Resolution (orchestrator)
+- Gemini BLOCKER → the SPECIFIC scenario CANNOT occur (verified): the guard's starting candidate is set
+  by incrementFileCounter() at line ~1297 BEFORE the guard, and incrementFileCounter NEVER yields "00"
+  (virgin EEPROM seeds '0','0' then ones++ → "01"; the cycle is 01..0F,10..FF). So the start is always
+  in-cycle and the wrap DOES return to it. BUT Gemini's underlying point is correct and important:
+  string-wrap termination is fragile, and with the soft-WDT disabled an unbounded scan would brick the
+  night. ACCEPTED the simpler numeric `attempts >= 256` bound — guaranteed-terminating regardless of the
+  filename cycle, and still covers the full 255-name namespace (satisfies R3 Codex#3). Defensive
+  correctness in WDT-off boot code beats "can't happen today".
+- Codex#1 MINOR → ACCEPTED (lightweight): validator now also requires a digit at prev[5]
+  (code=<digit>...) — rejects "code=\n"/"code=<nondigit>". ~free.
+- Codex#2 MINOR → ACCEPTED as a documented best-effort limitation (no code): under a transient SD I/O
+  fault probe.open()==false is read as "free", but the subsequent createContiguous fails on the same
+  fault → setupSDfail → REPLAYFL/idle, so no data is overwritten. Distinguishing media-error from
+  not-found isn't worth the flash here.
+### Tests after this round
+arduino-cli compile → links, 118716 bytes (96%), RAM 11848 (36%) unchanged. .hex produced.
+
+## Review round 5 (confirm round-4 BLOCKER fix) — Codex: APPROVED | Gemini: APPROVED
+### Codex findings
+No findings. Confirmed: remove-guard terminates on the `attempts < 256` numeric bound, closes
+`probe` on every successful open, finds any free/0-byte slot before fail-fast, fails only when all
+255 legal names are occupied by non-zero files; REPLAYFL now rejects `code=\n`/torn prefixes; no
+net-new boot-safety/data bug; normal no-reset SD path byte-identical.
+### Gemini findings
+No findings. Confirmed: (1) remove-guard bounded by `++attempts >= 256`, guaranteed-terminating,
+no off-by-one (covers 255-name namespace), no handle leak (`probe.close()` unconditional before the
+fail-fast test); (2) REPLAYFL `got>=6 && "code=" && digit@prev[5] && prev[got-1]=='\n'` correctly
+rejects `code=\n`; (3) `sdBusRecover()` gated behind initial `card.init()` failure and the
+stabilize delay gated inside the resume success block → a glitch-free boot bypasses both, byte-for-
+byte identical SD protocol + FAT mutation. No new regressions.
+### Resolution (orchestrator)
+Both APPROVED, no net-new findings → review CONVERGED. The round-4 numeric-bound + digit-check fix
+is confirmed correct by both reviewers. No code change this round.
+### Tests after this round
+No code change since round 4 → build unchanged: 118716 bytes (96%) of program storage, RAM 11848
+(36%). .hex present in build-grill/.
+
+## Final state
+Codex+Gemini both APPROVED at round 5 (rounds 1-4 CHANGES_REQUESTED→fixed, round 5 clean). Total 5
+review rounds + 1 implementation/architecture consult. Build green at 118716/122880 bytes (4164 B
+headroom), RAM 11848/32768. Artifact: build-grill/DefaultBoard.ino.hex. NOT flashed — final
+verification is the user's flash + overnight sleep test (a mid-night external reset cannot be
+reproduced on the bench).

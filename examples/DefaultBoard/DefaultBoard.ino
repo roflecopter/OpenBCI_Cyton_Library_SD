@@ -78,6 +78,16 @@ void setup() {
   resumeCount = EEPROM.read(7);
   if (resumeCount == 0xFF) resumeCount = 0;   // virgin EEPROM
 
+  // Park the SD chip-select HIGH (deselected) as raw GPIO BEFORE board.begin(). board.begin()
+  // brings up the shared DSPI and clocks the ADS1299 over the SAME SCK/MOSI/MISO lines; if a
+  // prior external glitch reset left the SD card selected + stuck mid-CMD25, those ADS init
+  // clocks would reach the card and corrupt its state further before sdBusRecover() can run.
+  // The MCU boots with high-Z GPIOs, so drive SD_SS high now; sdBusRecover() selects it later
+  // deliberately. (board.begin() already parks the ADS + accel chip-selects.) Harmless on a
+  // cold boot — the card is just deselected, exactly as it should be at rest.
+  digitalWrite(SD_SS, HIGH);   // set the latch HIGH first, THEN enable output, so flipping the pin to
+  pinMode(SD_SS, OUTPUT);      // OUTPUT can't briefly drive a power-up-low latch (select the card)
+
   // Bring up the OpenBCI Board (resets ADS chips, enables SPI). MUST run
   // before replaySessionFile() so the xNGSIBPnX commands the replay feeds
   // through processChar can talk to the ADS over SPI.

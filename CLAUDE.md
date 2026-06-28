@@ -50,6 +50,48 @@ Full audit trail in this repo: **`prep.md`** (9-round plan), **`prep-review-log.
 **`grill-review-log.md`** (implementation + 3-round Codex+Gemini review + the hardware test matrix).
 Don't re-litigate those decisions; read them first.
 
+## SD bus-recovery + robust auto-resume (2026-06-28) — built, NOT yet flashed/verified
+Branch `grill/cyton-sd-recover` (off `grill/cyton-rx-hardening`). Fixes the **silent 0-byte
+next-slot** failure: on the failing nights an **intermittent external power glitch** (leading
+candidate: the JST battery connector / a movement-dependent contact — the user is hardwiring/reseating
+it, which is the real *prevention*) resets the MCU **mid-CMD25**, leaving the card stuck holding the
+bus. The boot-level auto-resume (`replaySessionFile`) then can't `card.init()` the wedged card → opens
+the next slot but never writes it → 0-byte file, and `REPLAYFL.TXT` never lands either. A full
+power-cycle de-powers the card so cold init works — which is why resume "worked before." This change
+is the **SALVAGE path** (recover the night across chained slots; `collect_bci.build_session_chains`
+stitches `OBCI_5A`+`OBCI_5B`), not prevention. Key facts that shaped it:
+- **OBCI32_SD talks to the card over the HARDWARE DSPI** (`Sd2Card card(&board.spi, SD_SS)` →
+  `_spi->transfer()`), NOT software bit-bang — the Sd2PinMap `IOPORT_G` bit-bang branch is dead code.
+  So recovery uses the public DSPI API (`board.csLow/csHigh(SD_SS)`, `board.spi.transfer()`), no
+  PPS/LAT/TRIS poking. `board.begin()` fully inits the DSPI **before** `replaySessionFile()` runs.
+- **`sdBusRecover()`** (new): hardware-DSPI CMD25 abort — `csLow` → drain 520× `transfer(0xFF)`
+  (512 data + CRC + buffer) → bounded busy-wait MISO-high → `transfer(0xFD)` stop-tran → bounded
+  busy-wait → `csHigh` + 16 trailing clocks. All waits bounded by `millis()` deltas
+  (`SD_RECOVER_BUSY_MS=2000`), rollover-safe. **CMD12 deliberately dropped** — this firmware never
+  issues CMD18 (multi-block READ), so the card is never in a read-multiple state; saves flash.
+- **`replaySessionFile()`**: init-first → on failure `sdBusRecover()` → retry `card.init`+`volume.init`
+  (was unconditional recovery). Plus a resume-only `delay(SD_RESUME_STABILIZE_MS=2500)` before the
+  feed loop to let a just-power-glitched card settle. Non-resume path untouched.
+- **`writeReplayFail()`**: init-first/recover/retry + **non-destructive self-healing REPLAYFL** —
+  trusts an existing marker only if it parses (`code=<digit>…\n`), else removes + recreates with
+  `O_TRUNC`; snprintf clamped to `sizeof-1`.
+- **`setupSDcard()`**: fail-fast on `card.init` failure (no fall-through); a **remove-guard** before
+  `openfile.remove` skips deleting a *non-zero* prior slot (only reuses a genuinely 0-byte/free name),
+  bounded by a **numeric `attempts < 256`** scan (decoupled from the filename cycle — soft-WDT is OFF,
+  so an unbounded scan would brick the night); all 4 allocation failures route through new
+  **`setupSDfail()`** which removes the orphaned full-size file.
+- **`DefaultBoard.ino`**: park `SD_SS` HIGH as a raw GPIO **before** `board.begin()`
+  (latch-before-TRIS) so ADS init clocks can't reach a stuck card.
+- **Safety invariants held**: `executeSoftReset(0)` + soft-WDT self-reset stay **DISABLED** (their
+  rapid-fire loop was the night-eraser, rollback `6f6efe8` — do NOT re-enable); resume allocates a
+  **fresh contiguous slot**, never touches the prior slot's FAT/clusters; **normal no-reset night is
+  byte-for-byte identical** (recovery + stabilize delay both gated behind a failed `card.init`).
+- Build **118716 B (96%)**, 4164 B headroom, RAM 11848 B (36%). Audit: `prep.md` (delay-only scope,
+  7-round plan panel) + `prep-review-log.md` + `grill-review-log.md` (1 architecture consult + **5
+  Codex+Gemini review rounds**, both APPROVED at round 5). ⚠ **NOT flashed** — final verification is
+  the user's flash + an overnight sleep test (a mid-night external reset cannot be reproduced on the
+  bench). Flash with the normal `pic32prog` invocation above (NEVER a kill-timeout).
+
 ## Verified behaviour (2026-06-24, on hardware)
 Stray `F`/`j`/`s`/`1` ignored mid-stream (`B` held); auto-resume after power-cycle (×3, clean);
 `session_start.py --stop` round-trip; 45-min endurance run cleared block 101,340 with `B=2432000`
