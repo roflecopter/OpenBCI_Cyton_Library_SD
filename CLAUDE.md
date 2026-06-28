@@ -13,7 +13,10 @@ live in the memory note `project-openbci-cyton-b-working-board`.
 - **⚠ Flash is ~96 % full** (~118.5 KB / 122.88 KB). Any new code must be size-checked; the
   "Sketch uses N bytes" line is a hard gate. The dead WiFi path (`wifi.loop()` + wifi RX block)
   was dropped to make room — gc-sections reclaims the unreferenced WiFi methods (`wifi.begin`
-  kept). Trim more from there or from `!board.streaming`-gated diagnostic strings if needed.
+  kept). Trim more from there or from `!board.streaming`-gated diagnostic strings if needed —
+  **BUT FIRST read the "⛔ HOST-CONTRACT STRINGS" section below.** Several `Serial0.print` lines
+  look like diagnostics but are PARSED BY THE HOST and must NEVER be trimmed (this exact mistake
+  broke every recording start on 2026-06-28).
 - **Flash** (bootloader/OTA, no ICSP readback — bootloader is protected, not brickable, but
   a partial write needs a re-flash): connect the dongle, then as root
   `/home/lst/.arduino15/packages/chipKIT/tools/pic32prog/v2.1.46/pic32prog -d /dev/ttyUSB0 -b 115200 <hex>`.
@@ -21,6 +24,33 @@ live in the memory note `project-openbci-cyton-b-working-board`.
   Let it run to `Verify flash … done`. Build artifacts go to `build-grill/` (gitignore-worthy).
 - **git: github `roflecopter` remote, but z13's key isn't on github** → `git push` fails
   (publickey). Commit locally; rsync to p14s to push (same as paperlike/zmax). git.kto.to works.
+
+## ⛔ HOST-CONTRACT STRINGS — NEVER TRIM (these are NOT diagnostics)
+
+**`%META` (self-describing recordings) is one of this repo's core MUST features. The host
+handshake that writes it is carried over plain `Serial0.print` lines — so those lines are a
+CONTRACT with `openbci-session/session_start.py`, not debug chatter. NEVER remove or reword them
+to save flash.** `session_start.py` drives the board entirely by *parsing these exact strings*; if
+one goes missing the start silently fails (or %META/persist/tune silently don't verify) even though
+the board is fine. Each line below maps to a `re.findall`/`re.search` in the host — keep them
+byte-exact (the space after `Size`, the field order, the `OK`/`FAIL` tokens):
+
+| Firmware emits (`SD_Card_Stuff.ino`, `!board.streaming`-gated) | Host parses (`session_start.py`) | If trimmed |
+|---|---|---|
+| `Size <BLOCK_COUNT> SD file OBCI_NN.TXT` | `re.findall('Size ', res)` + `r'I\_.*\.T'` (filename) | **every start → "SD init failed"** (the 2026-06-28 regression) |
+| `META OK <len> <sum>` / `META FAIL` / `META ERR` | `parse_meta_ack` → `meta_status` | %META silently unverified → recordings lose channel labels |
+| `PERSIST OK <total> <sum>` / `PERSIST FAIL` | `re.search(r'PERSIST OK (\d+) (\d+)')` | SESSION.TXT (auto-resume) silently not confirmed |
+| `TUNE OK <id>` / `TUNE FAIL <code>` | `re.search(r'TUNE OK <id>\b')` | runtime-tunable overrides silently dropped |
+
+Library-level (in `OpenBCI_32bit_Library`, NOT this sketch — don't touch): `Sample rate is <N>Hz`
+(host line 350), the `?` register dump (`ADS`/`Registers`/`CONFIG`, `assert_board_idle`), and the
+`$$$` EOT (`board.sendEOT`). **Rule: before trimming ANY `Serial0.print`, grep
+`openbci-session/session_start.py` (and `collect_*.py`) for the literal — if the host matches it,
+it stays.** Strings that are genuinely safe to trim are the *failure-detail* ones the host does NOT
+parse (`"erase block fail"`, `"writeStart fail"`, `"initialization failed…"`, the closeSDfile
+write-time/overrun stats) — the host infers failure from the *absence* of the success string, so
+losing the failure text only costs human readability, never the handshake. The restored `Size`
+print carries a loud `⚠ HOST CONTRACT — DO NOT trim` comment in-code; add the same to any line here.
 
 ## Stray-RX hardening (2026-06-24) — flashed + hardware-verified
 Root cause of the repeated mid-night truncations/erased nights: the firmware dispatched
@@ -97,7 +127,15 @@ stitches `OBCI_5A`+`OBCI_5B`), not prevention. Key facts that shaped it:
   (kept `board.sendEOT()` — the `$$$` the host waits on; `%CKPT` still reports e/r/n live). ⚠ Gemini
   caught a real MAJOR: `EMIT_HEX16` is a macro that evaluates its arg 4× (once per nibble), so passing
   `millis()` directly tore the hex — fixed by snapshotting to a local `gapMs` first.
-- Build **118520 B (96%)** (below the pre-breadcrumb 118716 thanks to the trim), RAM 11852 B (36%).
+- **⚠ REGRESSION caught on hardware 2026-06-28 (now fixed):** the recovery-fix flash trim removed
+  setupSDcard's `Size <N> SD file OBCI_NN.TXT` success print — which `session_start.py` PARSES to
+  confirm the slot opened. Result: the board opened the slot fine but the host reported "SD init
+  failed" and exited before `b`, so a fresh start never recorded (the night was salvaged only because
+  a power-cycle made the firmware AUTO-RESUME from SESSION.TXT, which needs no host). Fixed by
+  restoring the exact print with a loud `⚠ HOST CONTRACT — DO NOT trim` in-code comment; see the new
+  "⛔ HOST-CONTRACT STRINGS" section above. Audit confirmed `Size` was the ONLY host string trimmed
+  (META/PERSIST/TUNE all intact). NOT yet flashed (recording was live) — goes out next flash.
+- Build **118600 B (96%)** (Size print restored; still below the original 118716), RAM 11852 B (36%).
   Audit: `prep.md` (delay-only scope, 7-round plan panel) + `prep-review-log.md` + `grill-review-log.md`
   (1 architecture consult + **5 review rounds for the recovery fix, both APPROVED at R5; +2 rounds for
   the breadcrumb, both APPROVED at R2** — all Codex+Gemini). ⚠ **NOT flashed** — final verification is

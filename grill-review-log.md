@@ -304,3 +304,31 @@ chars matching EMIT_LIT; ternary bounds rcv to a printable digit; trim preserves
 findings → CONVERGED (2 rounds).
 ### Tests
 arduino-cli compile → 118520 bytes (96%), RAM 11852 (36%). .hex in build-grill/.
+
+## Host-contract regression fix — restore the "Size " slot-open print (2026-06-28, hardware-caught)
+Found at RUNTIME on the first fresh start after flashing: session_start.py reported "SD init failed"
+even though the board opened the slot fine. Root cause: the recovery-fix flash trim removed
+setupSDcard's `Serial0.print("Size "); print(BLOCK_COUNT); print(" SD file "); println(currentFileName);`
+success line — which the HOST parses (`re.findall('Size ', res)` + `r'I\_.*\.T'` for the filename) to
+confirm the slot opened and to send %META + 'b'. No "Size " → host bails before 'b' → nothing records.
+The firmware panel had reviewed the firmware in ISOLATION and couldn't see the host contract.
+(Tonight's recording survived only because a user power-cycle made the firmware AUTO-RESUME from the
+SESSION.TXT the failed run had already written — auto-resume needs no host.)
+
+### Fix
+Restored the exact original print at the setupSDcard success point (fileIsOpen && !board.streaming) +
+a loud `⚠ HOST CONTRACT — DO NOT trim` comment. Build 118600 B (96%), RAM 11852 unchanged.
+
+### Audit (Gemini+Codex both demanded it — "if they trimmed Size, they trimmed others")
+Grepped the firmware for EVERY string session_start.py parses: `Size `(restored), `META OK/FAIL/ERR`
+(2/2/1 — intact), `PERSIST OK/FAIL/ERR`(2/2/2 — intact), `TUNE OK/FAIL`(2/4 — intact). `Sample rate
+is …Hz`, the `?` register dump, and `$$$` are library-level (untouched). PERSIST/TUNE/$$$/register
+dump were ALSO confirmed working live tonight. CONCLUSION: `Size ` was the ONLY host string trimmed.
+
+### Review — Codex: APPROVED | Gemini: APPROVED
+Both confirmed the restored line emits literal `Size ` + the OBCI_NN.TXT name (host regex matches),
+is correctly gated (fileIsOpen && !streaming, no mid-stream emit), is print-only (no control-flow
+change to sdBusRecover/breadcrumb/fail-fast paths), no net-new bug. MINORs: (1) Gemini `F()` macro —
+REJECTED (AVR Harvard-arch only; PIC32 maps const char[] to flash already, and the whole file uses
+plain literals — F() would be inconsistent + pointless). (2) both flagged "audit other host strings"
+— DONE above, all intact. Documented the contract in CLAUDE.md "⛔ HOST-CONTRACT STRINGS — NEVER TRIM".

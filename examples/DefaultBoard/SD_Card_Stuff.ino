@@ -1545,8 +1545,14 @@ boolean setupSDcard(char limit){
     #undef EMIT_BYTE
   }
 
-  if(fileIsOpen == true){  // slot opened OK — LED is the headless signal (Serial0 size print trimmed for flash)
-    if(!board.streaming) LED_SD_Status_Indication(OK_BLINKS, 250, OK_LED);
+  if(fileIsOpen == true){  // ⚠ HOST CONTRACT: session_start.py CONFIRMS slot-open by parsing "Size " +
+    if(!board.streaming) {  //   the OBCI_NN.TXT name out of this line. DO NOT trim it for flash again —
+      Serial0.print("Size ");          //   removing it makes EVERY start fail "SD init failed" even though
+      Serial0.print(BLOCK_COUNT);      //   the slot opened fine (regression flashed+caught 2026-06-28).
+      Serial0.print(" SD file ");
+      Serial0.println(currentFileName);
+      LED_SD_Status_Indication(OK_BLINKS, 250, OK_LED);
+    }
   }
   if(!board.streaming) {
     board.sendEOT();
