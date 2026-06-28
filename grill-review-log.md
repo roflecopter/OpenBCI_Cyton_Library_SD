@@ -278,3 +278,29 @@ review rounds + 1 implementation/architecture consult. Build green at 118716/122
 headroom), RAM 11848/32768. Artifact: build-grill/DefaultBoard.ino.hex. NOT flashed — final
 verification is the user's flash + overnight sleep test (a mid-night external reset cannot be
 reproduced on the bench).
+
+## Resume-diagnostics breadcrumb + flash trim (2026-06-28, single-flash bundle)
+Added AFTER the 5-round SD-recovery sign-off, at user request ("add the breadcrumb + a gap estimate;
+keep flashes minimal" → one flash with both). Change: (1) `uint8_t sdRecoverOutcome` stamped into the
+resumed slot's %BOOT as `rcv=<0-2>` (0 recovery not needed / 1 sdBusRecover ran + retry init OK / 2 ran
+but failed — practically unobservable since a failed recover returns before %BOOT); (2) `g=0x<HEX16>` =
+low-16-bits of millis() at slot creation = boot→resume latency = a LOWER BOUND of the inter-slot gap
+(no RTC → unpowered time unmeasurable; for a brief glitch off-time~0 so this is the estimate); both
+GATED behind `if (autoResume)` so a normal night's %BOOT is byte-for-byte unchanged; (3) flash trim —
+removed the closeSDfile `!board.streaming` console write-time/overrun stats (kept board.sendEOT $$$),
+net build 118520 B (below the pre-breadcrumb 118716).
+
+### Review round 1 — Codex: APPROVED | Gemini: CHANGES_REQUESTED
+- [Gemini MAJOR] EMIT_HEX16 is a macro evaluating its arg once per nibble (4x) → `EMIT_HEX16(millis()&0xFFFF)`
+  re-reads the live timer mid-expansion and can TEAR the hex across timestamps. (Latent: existing
+  EMIT_HEX16 callers pass stable globals.) → FIXED: snapshot `uint16_t gapMs = millis()&0xFFFF; EMIT_HEX16(gapMs);`
+- [Gemini MINOR] sdRecoverOutcome stale carry-over if replaySessionFile re-runs w/o BSS clear → FIXED:
+  `sdRecoverOutcome = 0;` at top of the recover block every invocation.
+- [Codex+Gemini MINOR] comment said "8-nibble hex" but emits 4 nibbles → FIXED comment.
+### Review round 2 — Codex: APPROVED | Gemini: APPROVED
+Both confirmed: gapMs is a single side-effect-free snapshot (no tearing/UB); sdRecoverOutcome reset
+each invocation; normal-night %BOOT byte-identical (autoResume gate); prefixR/prefixG are exactly 5
+chars matching EMIT_LIT; ternary bounds rcv to a printable digit; trim preserves sendEOT. No net-new
+findings → CONVERGED (2 rounds).
+### Tests
+arduino-cli compile → 118520 bytes (96%), RAM 11852 (36%). .hex in build-grill/.

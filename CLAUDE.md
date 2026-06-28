@@ -86,9 +86,21 @@ stitches `OBCI_5A`+`OBCI_5B`), not prevention. Key facts that shaped it:
   rapid-fire loop was the night-eraser, rollback `6f6efe8` — do NOT re-enable); resume allocates a
   **fresh contiguous slot**, never touches the prior slot's FAT/clusters; **normal no-reset night is
   byte-for-byte identical** (recovery + stabilize delay both gated behind a failed `card.init`).
-- Build **118716 B (96%)**, 4164 B headroom, RAM 11848 B (36%). Audit: `prep.md` (delay-only scope,
-  7-round plan panel) + `prep-review-log.md` + `grill-review-log.md` (1 architecture consult + **5
-  Codex+Gemini review rounds**, both APPROVED at round 5). ⚠ **NOT flashed** — final verification is
+- **Resume-diagnostics breadcrumb (same flash, +2 review rounds):** the resumed slot's `%BOOT` now
+  carries `rcv=<0-2>` (0 = no bus-recovery needed / 1 = `sdBusRecover` ran AND the retry init succeeded
+  = the fix salvaged the resume / 2 = ran but failed, ~never reaches %BOOT) and `g=0x<HEX16>` = low-16
+  bits of `millis()` at slot creation = boot→resume latency = a **lower bound** of the inter-slot
+  recording gap (no RTC, so the unpowered/in-reset duration is unmeasurable; for a brief glitch
+  off-time≈0 so this IS the gap estimate the host stitcher inserts). **Both gated behind `if
+  (autoResume)`** → a normal no-reset night's `%BOOT` is byte-for-byte unchanged. To fit it on the
+  96%-full flash, the closeSDfile `!board.streaming` console write-time/overrun stats were trimmed
+  (kept `board.sendEOT()` — the `$$$` the host waits on; `%CKPT` still reports e/r/n live). ⚠ Gemini
+  caught a real MAJOR: `EMIT_HEX16` is a macro that evaluates its arg 4× (once per nibble), so passing
+  `millis()` directly tore the hex — fixed by snapshotting to a local `gapMs` first.
+- Build **118520 B (96%)** (below the pre-breadcrumb 118716 thanks to the trim), RAM 11852 B (36%).
+  Audit: `prep.md` (delay-only scope, 7-round plan panel) + `prep-review-log.md` + `grill-review-log.md`
+  (1 architecture consult + **5 review rounds for the recovery fix, both APPROVED at R5; +2 rounds for
+  the breadcrumb, both APPROVED at R2** — all Codex+Gemini). ⚠ **NOT flashed** — final verification is
   the user's flash + an overnight sleep test (a mid-night external reset cannot be reproduced on the
   bench). Flash with the normal `pic32prog` invocation above (NEVER a kill-timeout).
 

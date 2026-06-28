@@ -27,6 +27,11 @@ int byteCounter = 0;    // used to hold position in cache
 //int blockCounter;       // count up to BLOCK_COUNT with this
 boolean openvol;
 boolean cardInit = false;
+// Resume bus-recovery outcome, stamped into the resumed slot's %BOOT (rcv=N):
+//   0 = first card.init succeeded, sdBusRecover NOT needed (clean-power-cycle path)
+//   1 = first init failed, sdBusRecover ran AND the retry init succeeded (the fix did its job)
+//   2 = sdBusRecover ran but init still failed (in practice no %BOOT is emitted then — REPLAYFL is)
+uint8_t sdRecoverOutcome = 0;
 boolean fileIsOpen = false;
 uint8_t BLOCK_DIV = 1;          // DEFAULT VALUE
 boolean sdBlockDivManual = false; // true if host sent explicit 'c'/'C' override
@@ -887,11 +892,14 @@ boolean replaySessionFile(){
   // SPI-mode bus recovery and retry init. On a normal/cold card the first init succeeds and recovery
   // NEVER runs -> a no-reset night is byte-for-byte unchanged, and a healthy card is never clocked at
   // full speed before its own low-speed identification inside card.init().
+  sdRecoverOutcome = 0;                                           // clean slate every invocation (guard stale carry-over)
   if (!cardInit) {
     if (card.init(SPI_FULL_SPEED, SD_SS)) cardInit = volume.init(card);
     if (!cardInit) {
       sdBusRecover();                                              // un-wedge a stuck CMD25
+      sdRecoverOutcome = 2;                                        // recovery ran (failed until retry proves otherwise)
       if (card.init(SPI_FULL_SPEED, SD_SS)) cardInit = volume.init(card);
+      if (cardInit) sdRecoverOutcome = 1;                          // retry init succeeded → the fix salvaged the resume
     }
   }
   if (!cardInit) {
@@ -1506,6 +1514,29 @@ boolean setupSDcard(char limit){
         EMIT_BYTE('0' + rc_emit);
       }
     }
+    // Resume-only diagnostics (a fresh-session %BOOT is byte-for-byte unchanged — autoResume==false):
+    //   rcv     = sdBusRecover outcome (0 not needed / 1 ran+retry-init OK / 2 ran but failed)
+    //   gap=0x  = HEX milliseconds from MCU boot to this slot's creation = the firmware-measurable
+    //             LOWER BOUND of the inter-slot recording gap (board.begin + bus recovery + 2.5s
+    //             stabilize + card init). The unpowered/in-reset duration before setup() is NOT
+    //             measurable (no RTC), so the true gap is >= this; for a brief power glitch the
+    //             off-time ~0 so this IS the gap estimate. The host stitcher inserts at least `gap`
+    //             ms between the prev slot's last sample and this slot's first. Emitted as 4-nibble
+    //             (16-bit low) hex via the existing EMIT_HEX16 — wraps at 65.5s (boot->resume is a
+    //             few seconds, so the wrap is unreachable in practice); decimal format pulled too
+    //             much flash.
+    if (autoResume) {
+      static const char prefixR[] = " rcv=";       // 5 chars
+      static const char prefixG[] = " g=0x";       // 5 chars  (gap floor, ms, low 16 bits = up to 65.5s)
+      EMIT_LIT(prefixR, 5);
+      EMIT_BYTE('0' + (sdRecoverOutcome > 2 ? 2 : sdRecoverOutcome));
+      EMIT_LIT(prefixG, 5);
+      // Cache millis() into a local FIRST: EMIT_HEX16 is a macro that evaluates its argument once per
+      // nibble (4x), so passing millis() directly would re-read the live timer mid-expansion and tear
+      // the hex across timestamps (Gemini R1 MAJOR). A snapshot makes all 4 nibbles consistent.
+      uint16_t gapMs = (uint16_t)(millis() & 0xFFFF);  // boot -> slot-create latency (the gap floor)
+      EMIT_HEX16(gapMs);
+    }
     EMIT_BYTE('\n');
 
     #undef EMIT_HEX16
@@ -1569,20 +1600,9 @@ boolean closeSDfile(){
     EEPROM.write(4, 0);  // legacy migration clear
     board.csHigh(SD_SS);  // release the spi
     fileIsOpen = false;
-    if(!board.streaming){ // verbosity. this also gets insterted as footer in openFile
-      Serial0.print("SamplingRate: ");Serial0.print(board.getSampleRate());Serial0.println("Hz"); //delay(10);
-      Serial0.print("Total Elapsed Time: ");Serial0.print(t);Serial0.println(" mS");              //delay(10);
-      Serial0.print("Max write time: "); Serial0.print(maxWriteTime); Serial0.println(" uS");     //delay(10);
-      Serial0.print("Min write time: ");Serial0.print(minWriteTime); Serial0.println(" uS");      //delay(10);
-      Serial0.print("Overruns: "); Serial0.print(overruns); Serial0.println(); //delay(10);
-      if (overruns) {
-        uint8_t n = overruns > OVER_DIM ? OVER_DIM : overruns;
-        Serial0.println("fileBlock,micros");
-        for (uint8_t i = 0; i < n; i++) {
-          Serial0.print(over[i].block); Serial0.print(','); Serial0.println(over[i].micro);
-        }
-        
-      }
+    if(!board.streaming){ // host clean-close path. Console write-time/overrun stats trimmed for flash
+                          // (to fit the resume rcv=/gap= breadcrumb); the %CKPT canary already reports
+                          // e/r/n during recording. KEEP sendEOT — session_start waits on the $$$ EOT.
       board.sendEOT();
     }
 
