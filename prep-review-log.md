@@ -1,373 +1,250 @@
-# prep-review-log — Cyton freeSD recording-truncation fix
-
-Adversarial panel: Codex (gpt-5.5) + Gemini (3.1 Pro). Claude orchestrates, casts no vote.
+# prep-review-log — robust post-reset SD auto-resume
 
 ## Round 1 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
-The panel reviewed the FIRST prep.md (root cause = "`sdMetaProcess` `%META` pCache overflow corrupts
-`BLOCK_COUNT`"). Both rejected it, and Gemini caught a factual error that — on verification against the
-code — **demolished the original root cause**. This round triggered a full re-diagnosis.
-
-### Codex findings (10; key ones)
-1. [BLOCKER] Overflow mechanism not reconciled: `%META` 234 B + `%BOOT` 57 B < 512, so the claimed
-   in-loop overflow isn't proven. Don't flash until the exact failing path is modelled.
-2. [BLOCKER] Raw `writeCache()` callers are a live class — fix all, not just `sdMetaProcess`.
-3. [BLOCKER] Final pad-flush could leave `byteCounter==512` / write a stale block.
-4-10. [MAJOR/MINOR] `B=` is a canary not proof; `SESS_<NN>.TXT` can disturb SD cache state; footer/
-   forced-fill coverage; `.map` may prove the wrong (pointer vs buffer) address; 10-15 min bench can't
-   validate the 12 h surface; `try/guard` wrong failure model for embedded; fix `meta verified` honesty.
-
-### Gemini findings (key ones)
-1. [BLOCKER] **"Hallucinated `writeCache()` contract → double-increment bug."** Lines 1856-1857
-   (`byteCounter=0; blockCounter++;`) are **inside `writeCache()` itself** (success path), NOT inside
-   `writeDataToSDcard`. `writeCache()` already resets/advances on every successful block. Injecting that
-   bookkeeping into `sdMetaProcess` would **double-increment `blockCounter`**. The bare `writeCache()`
-   pattern is already correct on the success path.
-2. [BLOCKER] The real `pCache` overflow is the `writeCache()` **error path**: `if(!resumed){ sdCardDead=
-   true; … return; }` returns without `byteCounter=0`, so a caller mid-`pCache[byteCounter++]` loop walks
-   past 512 on an SD write *failure*. Fix = `byteCounter=0;` in that block.
-3. [MAJOR] `SESS_<NN>.TXT` is flash bloat at 96 % + FAT risk — drop it.
-4. [MINOR] A short clean bench proves nothing about a transient-failure-triggered bug — must inject a fault.
-
-### Resolution (Claude) — VERIFIED AGAINST THE CODE, root cause REPLACED
-- **Gemini #1 ACCEPTED — confirmed by reading the source.** 1856-1857 are inside `writeCache()`; the
-  RAM-stage `%META` path (1461-1492) is already correct on the happy path. The original fix is WRONG and
-  dropped (prep Decision 4).
-- **Codex #1 ACCEPTED — and pursued to ground.** Audited EVERY `pCache` writer (`%META` replay, `%BOOT`
-  EMIT macros, `%CKPT` snprintf, `%E` flush, `convertToHex`, `writeFooter`): all bounds-checked / reset on
-  success. The ONLY overflow path is Gemini #2's error path, which needs an SD write failure — and the
-  06-23 footer recorded **zero** SD errors. ⇒ **no buffer overflow happened; `BLOCK_COUNT` was not
-  overflow-corrupted.** Original root cause refuted.
-- **Re-diagnosis from the raw card (OBCI_4E):** `BLOCK_COUNT` at fill = **101,000 = exactly the `F`/30-min
-  slot value** (integer-scaled), while the file = 2,432,000 = the `K`/12 h slot. The only producer of
-  101,000 is `setupSDcard`'s `F` switch case executing. `sdProcessChar` dispatches slot chars to
-  `setupSDcard()` **without the `!board.streaming` guard that P/T/M have**, and `setupSDcard` clobbers
-  `BLOCK_COUNT` before any guard. ⇒ **NEW root cause: a stray slot-char byte mid-session rewrites
-  `BLOCK_COUNT` to a shorter duration.** `%META`/`%START` absence + empty `OBCI_46/4B/4C` corroborate a
-  stray slot char in the handshake window calling `setupSDcard` → spurious `incrementFileCounter`.
-- **Gemini #2 ACCEPTED as a SEPARATE latent fix** (prep Decision 6) — real but not the 06-23 cause;
-  include the `byteCounter=0` one-liner while flashing.
-- **Gemini #3 ACCEPTED** — `SESS_<NN>.TXT` dropped (prep Decision 5).
-- **Gemini #4 / Codex #8 ACCEPTED** — replaced the weak bench with **deterministic stray-char injection**
-  (prep P3.2): send a slot char mid-stream and prove `B=2432000` holds.
-- **Codex #4 (`B=` canary not proof) ACCEPTED** — `B=` is explicitly a canary; the guard is the fix
-  (prep Decision 3). Codex #2/#3/#5/#7/#10 (raw-caller class, pad-flush, SESS cache, `.map`, meta honesty)
-  are **mooted** by the root-cause change (no `sdMetaProcess`/`SESS` edit, no overflow to prove).
-
-### prep.md changes this round
-Full rewrite: new root cause (unguarded `setupSDcard` `BLOCK_COUNT` clobber, arithmetic-proven from the
-card); fix = `setupSDcard` entry guard `if (board.streaming || SDfileOpen) return fileIsOpen;` + dispatch
-guard + `%CKPT B=` canary + Gemini #2 error-path one-liner; dropped the `sdMetaProcess` change and
-`SESS_<NN>.TXT`; Phase 0 = guard-safety proof + full command-byte audit; Phase 3 = direct fault injection.
-
-## Round 2 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
-Both reviewed the rewritten (new-root-cause) prep.md and CONVERGED on one net-new escalation.
+Both converged strongly on SD-SPI-protocol correctness of the `sdBusRecover` mechanism.
 
 ### Codex findings
-1. [BLOCKER] `j`/`s` remain single-byte night-killers — guarding only `setupSDcard` leaves the stray-RX
-   class alive; harden stop/control too (ignore during recording or require a multi-byte stop).
-2. [MAJOR] `SDfileOpen` guard safety still an assumption — PROVE from code (P doesn't set it; all
-   close/error/footer paths clear it; replay doesn't set it; test 2 sessions/uptime after natural & `j` close).
-3. [MAJOR] Predicate fixes only the slot clobber, not the wider stray-command class — P0.2 must produce
-   actual guards, not just an audit.
-4. [MAJOR] Missing `%META`/`%START` over-explained — treat as corroboration; harden/test b/M/s/j paths.
-5. [MAJOR] P3.2 insufficient as written — also inject in the `SDfileOpen && !streaming` handshake window
-   (before M and before b); assert `%META`/`%START`/counter/`B=`.
-6. [MINOR] Gemini `writeCache` `byteCounter=0` fix OK if scoped exactly (no block-counter change).
+1. [BLOCKER] reviewability — codex sandbox couldn't read the repo; couldn't verify file:line. → feed code inline next round.
+2. [BLOCKER] SD-protocol — CMD12 is the wrong stop for a stuck CMD25 WRITE; the terminator is the stop-tran DATA token 0xFD. CS-high idle clocks + CMD12 may be ignored/eaten as data.
+3. [MAJOR] SD-recover — plan doesn't identify what differs from existing card.init (already does CS-high + ≥74 idle clocks + CMD0). Must prove the missing step is stop-token/busy-drain/SPI-reinit, not "more clocks."
+4. [MAJOR] init-state — helper setting cardInit=true then running before the `if(!cardInit)` block can bypass volume.init/root.openRoot. Make recovery bus-only OR fully replace the init path.
+5. [MAJOR] data-integrity — "fresh slot can't hurt prior slot" is false: FAT is shared; reset mid-allocation can corrupt FAT; card.erase() can erase wrong clusters if FAT already damaged. Weaken claim or preallocate slots before the night.
+6. [MAJOR] destructive — openfile.remove(currentFileName) on resume can delete valid data (counter wrap / stale SESSION.TXT / un-ingested card / collision). Never remove an existing target; scan forward to a free name or fail read-only.
+7. [MAJOR] forensic — making writeReplayFail recover-the-bus-and-write REPLAYFL turns a previously-FAT-untouching failure path into a new post-fault FAT mutation. Don't allocate forensic files after a failed resume unless preallocated.
+8. [MAJOR] boundedness — raw spiSend before SPI init can spin forever (PIC32 SPI status); soft-WDT disabled → bricks boot. Init SPI/pins at safe speed; every wait needs a millis timeout.
+9. [MINOR] flash — "Sketch uses N bytes" insufficient; require map/symbol delta; reject new Print/string pulls.
+10. [MINOR] test — random mid-record MCLR pulse may land between writes (false pass). Trigger reset while CS low / inside the CMD25 window.
+11. [MINOR] RF-current — deferral OK as scope control, but if resets are brownout-current related, gating RF TX during SD-only logging may PREVENT vs recover; make it the next measured mitigation.
 
 ### Gemini findings
-1. [BLOCKER] Better mechanism for missing `%META`/`%START`: a MID-STREAM stray slot char → `setupSDcard`
-   → `createContiguous` fails (SPI locked in multi-block write) → keeps old `bgnBlock` → `writeStart(bgnBlock)`
-   restarts at block 0 → overwrites `%META`/`%START`/`%BOOT`. Fix the justification (guard still fixes it).
-2. [BLOCKER] Unguarded `j`/`s`/channel toggles leave the session brittle — implement **wholesale RX
-   hardening in `loop()`: ignore all command bytes while streaming except a hardened multi-byte stop**.
-3. [MAJOR] P3.2 must also inject `j`/`s`/`1` mid-stream; recording must continue, channels intact.
-4. [MINOR] Decision-1 guard + Gemini `byteCounter=0` are safe (single-threaded dispatch ⇒ no timing gap;
-   `SDfileOpen` reliably cleared by `closeSDfile`; auto-resume fine) — but augment with Finding 2.
+1. [BLOCKER] SD-protocol — clocks with CS HIGH are ignored; CMD12 is wrong for CMD25; card.init() already sends 80 idle clocks. Proper CMD25 abort: CS LOW → 0xFD stop-tran token → wait MISO high (BUSY) → optional CMD12 (for stuck CMD18 reads) → CS HIGH → card.init().
+2. [BLOCKER] hw-state — after a warm reset the PIC32 SPI peripheral is at disabled default; using library SPI sends before init → hardware wait loop (while(!SPIRBF)) hangs forever on boot. Fix: SPI.begin() first OR bit-bang via digitalWrite/digitalRead.
+3. [MAJOR] data-integrity — un-wedging the card REOPENS the rapid FAT-corruption race: today a wedged card's createContiguous FAILS (shields FAT); succeeding it means a FAT update a second physical bounce can corrupt → the 6f6efe8 risk. Fix: stabilization/debounce delay (~3s) at boot before SD init + createContiguous.
+4. [MAJOR] concurrency — naive while(MISO==LOW) busy-wait on 0xFD flush bricks the MCU on a dead/locked card (soft-WDT off). Needs strict millis() timeout (~500ms) + graceful abort.
+5. [MINOR] flash — modifying Sd2Card to expose SPI risks ballooning size; implement recovery as a tiny inline GPIO bit-bang.
+6. [MINOR] power — DEFER the RF-TX idea; modifying the streaming/handshake path is risky.
 
-### Resolution (Claude) — net-new MAJOR accepted; fix escalated to two layers
-- **Codex #1 / #3, Gemini #2 ACCEPTED (net-new BLOCKER/MAJOR) → LAYER A.** Adopted wholesale RX
-  hardening: `loop()` ignores all inbound command bytes (Serial0/1/wifi) while `streaming && SDfileOpen`,
-  except a 3×`j`-within-2 s hardened stop. Confirmed from code that `loop()` (142-180/217-227) feeds RX to
-  `sdProcessChar`→`board.processChar` even while streaming, so stray `j`/`s`/`1`-`8` reach destructive
-  handlers. Closes the whole class. (prep Decision 1.)
-- **Codex #2 ACCEPTED — proven from code (P0.1).** `SDfileOpen` set only by `setupSDcard`/`closeSDfile`,
-  cleared on every end path (1357/988/1668/1835), false on fresh boot; `P`/`T`/`M` don't set it. Added a
-  HOST belt: `session_start` sends `j` before the slot char so it's false even with no power-cycle
-  (prep Decision 3). Gemini #4 independently confirms this is safe.
-- **Gemini #1 ACCEPTED — verified + worse.** Read `setupSDcard` 1130-1189: on mid-stream re-entry it runs
-  `incrementFileCounter`/`volume.cacheClear`/`card.erase(bgnBlock,endBlock)`/`writeStart(bgnBlock)`/
-  `blockCounter=0`/`%BOOT` re-emit with NO early return on `createContiguous` failure — so it can erase the
-  live recording, not just clobber `BLOCK_COUNT`. Adopted as the corroborating mechanism (Codex #4:
-  corroboration, not load-bearing). The Layer-B guard prevents the whole re-entry. (prep P0.3.)
-- **Codex #5 / Gemini #3 ACCEPTED → P3.2 expanded** to inject slot char + `j` + `s` + `1` both mid-stream
-  AND in the handshake window, plus a hardened-stop positive test.
-- **Codex #6 / Gemini #4 (writeCache fix) ACCEPTED, scoped** — `byteCounter=0;` only, no block-counter
-  change (prep Decision 7, P0.4).
-- Kept Layer B (`setupSDcard` entry guard) for the pre-streaming handshake window + defense-in-depth.
+### Resolution (Claude — orchestrator, no vote)
+ACCEPTED (all material findings):
+- Recovery sequence corrected to the proper CMD25 abort: **CS LOW → send 0xFD stop-tran token →
+  bounded busy-wait for MISO high (millis timeout ~500ms) → CS HIGH → then the existing
+  card.init/volume.init/root path.** Drop CMD12-as-primary (optional, only to also clear a stuck
+  CMD18 read). (Codex #2/#3, Gemini #1)
+- **Bit-bang the recovery over GPIO** (digitalWrite MOSI/CLK/CS, digitalRead MISO) so it does NOT
+  depend on the (uninitialized) SPI peripheral and stays flash-tiny. (Gemini #2/#5, Codex #8)
+- **Every wait bounded by millis() timeout**; helper provably cannot hang. (Codex #8, Gemini #4)
+- **sdBusRecover is BUS-CLEANUP-ONLY** — it does NOT set cardInit/volume/root; the existing
+  `if(!cardInit){card.init; volume.init} … root.openRoot` block runs unchanged after it. (Codex #4)
+- **openfile.remove guard**: on the resume path, never remove a nonzero existing target — scan the
+  file counter forward to a guaranteed-free name (bounded), else fail read-only (REPLAYFL). (Codex #6)
+- **FAT-race**: add a stabilization delay before the resume's createContiguous; ALSO evaluate
+  **preallocating the continuation slot at stable session-start** (no resume-time FAT write at all)
+  as the stronger option — round 2 to judge feasibility within flash. Safety claim weakened. (Codex #5/#7, Gemini #3)
+- **REPLAYFL**: only via the same bounded bus-recover; accept it is itself a small FAT mutation —
+  gate it so it's attempted at most once and never loops. (Codex #7)
+- **Codex reviewability**: round 2 prompt embeds the actual code inline. (Codex #1)
+- **Test plan**: reset injected inside the CMD25 write window (CS low), not a random pulse. (Codex #10)
+- **RF-TX**: stays DEFERRED but explicitly named the next measured mitigation. (Codex #11, Gemini #6)
+- **Flash gate**: map/symbol delta, reject new Print/string pulls. (Codex #9, Gemini #5)
+REJECTED: none (all findings accepted or folded).
+prep.md updated accordingly for round 2.
 
-### prep.md changes this round
-Restructured the fix into LAYER A (wholesale RX-ignore-during-stream + 3×`j` stop, DefaultBoard.ino
-`loop()`) + LAYER B (`setupSDcard` entry guard + dispatch mirror) + HOST `j`-belt; `%CKPT B=` canary;
-scoped `writeCache` `byteCounter=0`. P0 now proves the `SDfileOpen` lifecycle + scopes Layer A + confirms
-Gemini's re-entry mechanism. P3.2 expanded to multi-byte fault injection in both windows. Added an
-auto-resolved ASSUMPTION tag for the wholesale-RX-hardening choice.
+## Round 2 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED (code embedded this round)
+### Codex findings
+1. [BLOCKER] SD recovery — single 0xFD not phase-safe: a reset can land card-busy or mid-data-block; 0xFD then ignored or eaten as payload. Fix: CS low → drain busy (timeout) → clock 0xFF to complete/realign a partial block → bounded wait → 0xFD at a token boundary → bounded busy-wait → CS high → idle clocks → card.init.
+2. [BLOCKER] GPIO recovery — pin ownership underspecified; board.csLow/csHigh is DSPI-coupled (Sd2Card card(&board.spi,SD_SS), L20/L103); GPIO writes won't clock the card if DSPI owns SCK/MOSI or pins are inputs. Fix: don't use board.cs*; disable/release DSPI, set SD_SS/SCK/MOSI OUTPUT + MISO INPUT, drive idle, bit-bang, then card.init reinits DSPI.
+3. [BLOCKER] setupSDcard — createContiguous/contiguousRange failure (L1224-1241) only sets cardInit=false, falls through into card.erase(bgnBlock,endBlock) + writeStart with STALE range → erase/write WRONG blocks. Fix: fail-fast, release CS, return before erase/writeStart; never erase/write unless contiguousRange succeeded.
+4. [MAJOR] FAT race — Decision 5 rejects preallocation without evidence; the alloc primitives are already linked so a reserved-next-slot may be small + no obvious host-protocol bump. Fix: prototype/map-size 1-slot preallocation before rejecting, OR explicitly accept the design can orphan prior data on a 2nd bounce. Preallocation is safer for irreplaceable data.
+5. [MAJOR] REPLAYFL — writeReplayFail unconditionally SdFile::remove("REPLAYFL.TXT") (L769) before recreate; a reset after the unlink loses prior forensics + another FAT mutation; a RAM one-shot resets across MCU resets. Fix: don't remove an existing REPLAYFL; skip/append-without-alloc; gate after stabilization; persistent-enough guard.
+6. [MINOR] normal-night — stabilization delay before the SESSION.TXT-absent return breaks behaviour-identical. Fix: delay only after valid resume intent, immediately before the first resume FAT write.
+
+### Gemini findings
+1. [BLOCKER] GPIO vs DSPI — DSPI owns SCK/MOSI/MISO once board.begin() ran; digitalWrite silently fails; post-reset pins are hi-Z inputs. Fix: disable SPI peripheral (SPI.end()/clear DSPI ON) + pinMode SCK/MOSI OUTPUT, MISO INPUT before bit-bang; card.init reinitialises DSPI.
+2. [BLOCKER] writeReplayFail — sdBusRecover does no CMD0/ACMD41/SPI config; replacing card.init guarantees volume.init fails. Fix: sdBusRecover must PRECEDE card.init; keep card.init.
+3. [MAJOR] remove-guard scope — setupSDcard's openfile.remove runs for ALL starts; a resume-only wrapper leaves cold-starts vulnerable to counter-wrap overwrite. Fix: size-guard UNIVERSALLY in setupSDcard — open target O_READ; if exists & fileSize()>0, bounded incrementFileCounter to a free/0-byte slot before remove().
+4. [MINOR] CMD12 — if reset during CMD18 multi-block READ, card drives MISO, 0xFD ignored, wait times out, bus still wedged. Fix: make bit-banged CMD12 MANDATORY after 0xFD.
+- Gemini ANSWER on the split: delay defensible, preallocation needs EEPROM state + host-protocol mods exceeding flash.
+
+### Resolution (Claude — orchestrator, no vote)
+ACCEPTED:
+- Phase-safe abort (Codex#1): CS low → bounded busy-drain → 0xFF realign clocks → 0xFD at token boundary → bounded busy-wait → MANDATORY CMD12 (Gemini#4) → CS high → idle clocks → existing card.init.
+- DSPI handling (Codex#2, Gemini#1): sdBusRecover disables the SPI/DSPI peripheral + pinMode SCK/MOSI OUTPUT, MISO INPUT, drives idle, bit-bangs raw GPIO; does NOT use board.cs*; card.init afterward reinitialises DSPI. All waits millis-bounded.
+- setupSDcard FAIL-FAST (Codex#3): slot-alloc returns success/failure; on create/contiguousRange failure release CS + return BEFORE erase/writeStart. (Pre-existing latent bug; fix it.)
+- UNIVERSAL remove-guard (Gemini#3, Codex#6-ish): inside setupSDcard, before remove(), O_READ the target; if exists & fileSize()>0 bounded-incrementFileCounter to a free/0-byte name; never remove a non-zero file. Applies to cold + resume.
+- writeReplayFail (Gemini#2, Codex#5): sdBusRecover PRECEDES card.init (keep card.init); do NOT remove an existing REPLAYFL — skip if present; gate after stabilization; one attempt.
+- Stabilization delay CONDITIONAL (Codex#6): only after resume intent confirmed (SESSION.TXT valid), immediately before the first resume FAT write — normal bedtime boot unchanged.
+SPLIT RESOLUTION (FAT race, Codex#4 vs Gemini): Gemini's EOF-parsing objection is factually wrong (collect_bci already binary-searches the NUL-padded tail of every full-size file, so a preallocated padded continuation reads identically — no host-protocol change). BUT preallocation still needs a setupSDcard hot-path branch (open-existing-preallocated-slot vs createContiguous) + covers only the 1st reset. RESOLUTION: PRIMARY = stabilization delay (zero-flash, covers all resets, empirically 0/3 events corrupted); /grill MUST map-size a 1-slot preallocation prototype and ADOPT it if it fits flash cleanly without destabilising the normal path (it's strictly safer — no resume-time FAT write); else ship delay-only with the residual risk DOCUMENTED + named escalation. Codex's "don't reject without measuring" honored by deferring the measurement to /grill.
+REJECTED: none.
+prep.md updated for round 3.
 
 ## Round 3 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
-Net-new BLOCKERs that reshaped the fix (NOT a confirmation round). NB: both reviewers reported the sandbox
-DENIED repo access → they reviewed plan-text only; Claude's line-cited source reads are the authority.
+### Codex
+1. [BLOCKER] replay path can skip post-recovery card.init: sdBusRecover disables DSPI; if cardInit already true the `if(!cardInit)` block skips card.init → disabled bus for root.openRoot/sess.open. Fix: force cardInit=false (or call card.init unconditionally) after recovery.
+2. [BLOCKER] "a few 0xFF" not phase-safe: reset mid-512B-payload → card awaits rest of block + CRC; 0xFD/CMD12 swallowed as payload. Fix: fixed worst-case drain (≥1 full data packet + margin), CS reselect to reset framing, bounded response consumption.
+3. [BLOCKER] delay-only fallback still unsafe for irreplaceable data: 2nd interruption during createContiguous can orphan prior slot. Fix: REQUIRE no resume-time FAT alloc — preallocation (open reserved slot → contiguousRange → writeStart, no remove/createContiguous) OR fail read-only with REPLAYFL.
+4. [MAJOR] preallocation can't be safely adopted by current setupSDcard: it always increments+removes/creates; a full-size preallocated slot trips the guard (fileSize>0) or gets removed; size/contiguity alone can't tell preallocation from a real full-size recording. Fix: explicit resume-only adopt-branch with a reliable empty-marker before remove/create.
+5. [MINOR] 0-byte audit slots still removable (guard only scans past fileSize>0; a 0-byte collision is still removed). Fix: scan past any OBCI_*.TXT, or weaken "leave 0-byte slots" language.
+### Gemini
+1. [BLOCKER] preallocation ↔ universal-guard contradiction (same as Codex #4): guard skips fileSize>0 → never adopts the preallocated slot on cold boot → orphans a 512MB file every boot, exhausts card. Fix: explicit adopt-branch + magic header to distinguish preallocation from real data.
+2. [BLOCKER] "a few 0xFF" insufficient (same as Codex #2): must clock ≥514 bytes (512+2 CRC) to flush a partial payload block before 0xFD.
+3. [MAJOR] setupSDcard "return false" won't compile — claims it's void. → REJECTED: setupSDcard is `boolean setupSDcard(char limit)` (L1143), returns fileIsOpen (L1403). `return fileIsOpen;`/`return false;` compiles. Gemini factual error; verified against source.
+4. [MAJOR] file-handle leak in remove-guard loop: O_READ test-open of the global openfile must .close() each iteration before incrementFileCounter/next open, else opens fail / createContiguous corrupts. → ACCEPTED.
+5. [MINOR] REPLAYFL "skip if exists" = permanent blind spot if host never deletes it. → collect_bci ALREADY unlinks REPLAYFL on ingest (py-qs-data: copy to backup + unlink), so it won't persist across nights; keep skip-if-exists + note host-side removal. (Alt: O_APPEND.)
 
-### Codex findings
-1. [BLOCKER] Handshake window still exposes destructive bytes (`j`/`1`/premature `b`) — Layer A inactive
-   when `!streaming`, Layer B only blocks slot re-entry. Add a handshake allowlist/lock.
-2. [BLOCKER] Host `j`-belt no longer guarantees cleanup once Layer A ignores a lone `j`; host must use the
-   hardened stop + verify closed.
-3. [MAJOR] `jjj` is not hardened against repeated-byte RF/UART bursts — use a non-repeating token or remove
-   in-band stop for sleep builds.
-4. [MAJOR] RX hardening must cover EVERY ingress (the `writeCache` extended-recovery drain) — centralize.
-5. [MAJOR] P3.2 insufficient — inject `j`/`s`/`1`/premature `b`/bursts/partial sequences, in both windows.
-6. [MAJOR] DSPI hard freeze still parked → narrow the "trust a sleep night" claim or include a watchdog.
-7. [MINOR] Flash trim order lists host items (no PIC32 cost) — trim firmware first.
-8. [MINOR] Sandbox couldn't read the repo → cited lifecycle proof needs direct source verification.
-
-### Gemini findings
-1. [BLOCKER] Host `j`-before-slot DELETES the just-written SESSION.TXT (`P` writes it first;
-   `closeSDfile`→`SdFile::remove`) → breaks auto-resume. (Send `j` before `P`, or drop the belt.)
-2. [BLOCKER] The 3×`j` stop is EATEN by `writeCache`'s 8 s extended-recovery serial drain
-   (`while(hasDataSerial0()) getCharSerial0();`) — a stop during a stall never reaches `loop()`.
-3. [BLOCKER] Retracts its own round-2 "mid-stream block-0 overwrite" — physically impossible under the
-   CMD25 multi-block lock; the total `%META` absence proves a HANDSHAKE-window hit (before block 0 flush).
-4. [MAJOR] 3×`j` is the weakest stop vs repeated-byte bursts — use distinct chars.
-5. [MAJOR] P3.2 misses recovery-drain + SESSION.TXT-survival checks.
-
-### Resolution (Claude) — fix converged; in-band stop & host belt RETIRED
-- **Codex #1/#3/#4, Gemini #2/#4 ACCEPTED → drop the in-band stop entirely (Decision 2).** A stop
-  byte/sequence is itself RF-forgeable (a burst IS `jjj`) and is eaten by the recovery drain. Removing it
-  closes both holes. Sleep workflow never needs it (auto-fill/power-cycle).
-- **Codex #1 ACCEPTED → handshake allowlist (Decision 1).** Generalized Layer A into ONE centralized,
-  state-keyed `dispatchCommandByte` (IDLE normal / HANDSHAKE allow only `b`/`~`/`?` / RECORDING drop all),
-  called from all 3 ingress sites. Verified from host source the only post-slot-char bytes are `~~`,`M`,`b`
-  (`M`/`P`/`T` consumed by their processors first). Covers Codex #4 (centralized; recovery drain only
-  discards).
-- **Gemini #1 ACCEPTED → drop the host `j`-belt (Decision 4).** It would delete the fresh SESSION.TXT and
-  is unnecessary (P0.1 proves `SDfileOpen==false` at legit start); the still-open edge fails LOUD instead.
-- **Gemini #3 ACCEPTED → corrected mechanism (P0.3).** Adopted the handshake-window `volume.cacheClear`
-  discard-of-unflushed-`%BOOT`+`%META` as the likely path; explicitly marked corroboration-only (exact
-  write-pointer behavior NOT relied upon — the guards prevent the re-entry either way).
-- **Codex #5 / Gemini #5 ACCEPTED → P3.2 expanded** (slot/`j`/`s`/`1` + bursts, both windows, recovery-drain
-  injection, no-in-band-stop check) + **P3.2b SESSION.TXT survival**.
-- **Codex #6 ACCEPTED → scope narrowed (Decision 9):** claim covers the stray-RX class only; DSPI freeze
-  explicitly out.
-- **Codex #7 ACCEPTED** — firmware-only trim order. **Codex #8 / Gemini sandbox-denied ACCEPTED (P0.6)** —
-  panel reviewed plan-text only; /grill re-verifies the cited code on the real build before flash.
-- Verified from source this round: `loop()` dispatch (159-169), host send order (channel/`~`/`T`/`P` before
-  slot; `~~`/`M`/`b` after), `setupSDcard` re-entry body (1130-1189: `cacheClear`/`erase`/`writeStart`/
-  `blockCounter=0` with no early return), `SDfileOpen` lifecycle.
-
-### prep.md changes this round
-Goal/Decisions rewritten: single centralized state-keyed RX policy (Decision 1) + no in-band stop (2) +
-Layer-B guard (3) + no host belt (4) + `B=` canary (5) + scoped error-path fix (7) + narrowed scope (9).
-Plan P0.2 now specifies `dispatchCommandByte` covering all ingress; P0.3 corrected mechanism; P0.6 source
-caveat. P3.2 expanded + P3.2b. Files/Risks updated; added the unexplained-2.73 h-elapsed anomaly as an
-honest open question.
+### Resolution (Claude — orchestrator)
+ACCEPTED: phase-safe drain must clock a FULL block+CRC (~514B) not "a few" (Codex#2/Gemini#2); force
+card.init after recovery (Codex#1); remove-guard must .close() the test handle each loop (Gemini#4);
+clarify guard preserves NON-ZERO REAL-DATA files only, 0-byte slots may be overwritten (Codex#5);
+REPLAYFL skip-if-exists is fine — collect_bci removes it nightly (Gemini#5).
+REJECTED: Gemini#3 (setupSDcard is boolean, not void — source-verified).
+ESCALATED TO USER (Codex#3/#4, Gemini#1): the panel has converged that RESUME-TIME FAT WRITE is unsafe
+for irreplaceable data, and the safe alternative (preallocation + empty-marker adopt-branch) is a
+materially bigger/riskier change that may not fit the ~4.4KB flash. This is a data-loss-risk SHAPE
+decision = the user's call (forensics-only+hardware vs full preallocation recovery vs delay-only). Plan
+finalisation pauses on the answer.
 
 ## Round 4 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
-Several net-new BLOCKERs on the round-3 design (still not converged). NB: panel again sandbox-denied repo
-access — plan-text only; Claude's source reads are authority.
-
+(First round on the DELAY-ONLY scope after the user's decision; preallocation dropped.)
 ### Codex findings
-1. [BLOCKER] `P`/`T`/`M` bypass the centralized policy (run before it, gated only on `!streaming`) → forged
-   `P`/`T` reachable in HANDSHAKE. Gate frame commands too (HANDSHAKE = only the `M` frame).
-2. [BLOCKER] A forged `b` in HANDSHAKE starts streaming before `%META` → real `M` then blocked → no `%META`
-   (the OBCI_4E symptom). Require a `metaWritten`/armed flag before accepting `b`.
-3. [MAJOR] Power-cycle is not a clean stop with auto-resume — leaves SESSION.TXT → next boot resumes; can't
-   distinguish "resume after outage" from "user ended early." Document or add an abort path.
-4. [MAJOR] "Fails loud" can't be optional — `session_start` MUST hard-fail on slot-char rejection.
-5. [MAJOR] The 2.73 h-vs-29 min anomaly needs a pass/fail invariant (`B=` won't catch slow acquisition).
-6. [MINOR] `~`/`?` in HANDSHAKE need side-effect proof (could enter a multi-byte setting state).
-
+1. [MAJOR] 0xFD can still be sent while CMD25 is busy — after the ≥514 drain the card emits a
+   data-response then holds MISO low to program; a stop token in that busy phase is ignored.
+   Fix: consume data-response + wait MISO-high before 0xFD; timeout → fail-fast before FAT writes.
+2. [MAJOR] Shared-SPI slaves not explicitly deselected — ADS1299 shares DSPI; its CS low/floating
+   can corrupt MISO / eat clocks during bit-bang. Fix: drive every non-SD CS GPIO-output-high first.
+3. [MAJOR] DSPI re-acquire underspecified after a raw ON-bit clear — card.init may not fully re-init
+   PPS/peripheral. Fix: release/reacquire through the same DSPI API, or re-run DSPI/PPS before card.init.
+4. [MAJOR] Remove-guard exhaustion behaviour undefined — a ≤16 scan conflicts with MAX_RESUMES=25;
+   if all candidates non-zero, no hard-fail path stated. Fix: align cap to namespace, fail before remove.
+5. [MINOR] Bit-bang SPI/CMD12 details — pin down SPI mode 0, discard CMD12 stuff byte, parse R1/R1b.
 ### Gemini findings
-1. [BLOCKER] Removing the in-band stop → unkillable auto-resume LOCKOUT: power-cycle to abort leaves
-   SESSION.TXT → boot resumes → RECORDING drops all → locked out until 12 h fills. Add a hardened distinct
-   multi-byte escape honored in all states.
-2. [BLOCKER] HANDSHAKE allowlist desyncs the multi-byte `~` (`~6`→`~` passes, `6` dropped, next `b` eaten as
-   rate param); also a stray `~` could eat the legit `b`. Move rate config before the slot char; remove `~`
-   from the allowlist (leave only `b`/`?`).
-3. [MAJOR] Layer-B guard `return fileIsOpen` returns TRUE → caller prints "Size N" → SILENT destructive
-   merge. Must reject at the caller (`break`, no reassign, no print) so the host times out / fails loud.
-4. [MINOR] The 2.73 h anomaly is fully explained by stray `s` (pause) + later `b` (resume) + `F` (clobber) —
-   covered by Layer A; no extra code, but verify.
-
-### Resolution (Claude) — converged on a richer policy; verified the lockout & host order in source
-- **Gemini #1 / Codex #3 ACCEPTED → reinstated a HARDENED DISTINCT ≥4-byte escape (Decision 2).** Confirmed
-  boot-time `replaySessionFile()` is active (DefaultBoard.ino:107) → the lockout is real. Round 3's "no
-  stop" went too far; a distinct multi-byte token (immune to repeated-byte bursts) fed by every ingress
-  byte incl. the recovery drain (Gemini r3's drain-eats-it) → clean abort (removes SESSION.TXT). Kept
-  auto-resume (user's stated preference); flagged the disable-auto-resume alternative for the user.
-- **Gemini #2 / Codex #6 ACCEPTED → `~` removed from HANDSHAKE; host drops post-slot `~~`.** Verified the
-  host sends rate (`~5`) BEFORE the slot char; the post-slot `~~` (line 451) is a non-load-bearing query.
-  HANDSHAKE now allows ONLY `b` (after `metaArmed`).
-- **Codex #1 ACCEPTED → gate `P`/`T` to IDLE** (`&& !SDfileOpen` at 288/578); `M` stays HANDSHAKE-legal.
-- **Codex #2 ACCEPTED → `metaArmed` flag** gates `b` in HANDSHAKE (premature-`b` fix; also a cleaner
-  explanation of the missing `%META`).
-- **Gemini #3 ACCEPTED → Layer B moved to the CALLER** (`sdProcessChar` slot-case `break`; NOT inside
-  `setupSDcard`) so a rejected slot char prints nothing → host fails loud, and `SDfileOpen` is never
-  wrongly reassigned. Critical return-value fix.
-- **Codex #4 ACCEPTED → host fail-loud is MANDATORY** (Decision 4 / P1.5).
-- **Codex #5 / Gemini #4 ACCEPTED → P3.2c acquisition invariant** (footer elapsed ≈ sample-count/rate);
-  anomaly explained as stray `s`-pause, covered by Layer A, verified by the invariant.
-- Verified in source this round: `replaySessionFile()` active at setup() (lockout real); host send order
-  (`~5`/channels/`T`/`P` before slot; `~~`/`M`/`b` after); `~` is the multi-byte rate prefix.
-
+1. [BLOCKER] Missing busy-wait after flushing the dummy block (same as Codex#1) — 0xFD during BUSY
+   ignored → permanently stuck in CMD25. Fix: bounded MISO-high wait AFTER ≥514 0xFF and BEFORE 0xFD.
+2. [BLOCKER] Remove-guard fall-through destroys data on exhaustion (same as Codex#4) — loop hits its
+   bound with currentFileName still non-zero → falls through to remove() deleting a valid file.
+   Fix: after the loop re-check fileSize()>0; if still non-zero, fail-fast (abort/return false), never remove.
+3. [MINOR] Ambiguous SCK idle polarity — mode 0 needs SCK idle LOW; if it idles HIGH, CS-low makes a
+   false clock edge that misaligns the bit counter. Fix: drive SCK LOW in the initial GPIO setup.
+### Resolution (Claude)
+ALL net-new (none re-raise R1-R3; the dropped preallocation was correctly NOT re-raised). Both models
+independently flagged the busy-wait-before-0xFD hole AND the remove-guard exhaustion hole = strong signal.
+- Codex#1 + Gemini#1 → ACCEPTED. Decision 2 step 3 added: consume data-response + bounded MISO-high
+  busy-wait BEFORE 0xFD; timeout = fail-fast. (This was the genuinely dangerous miss — without it the
+  recovery silently leaves the card wedged in exactly the mid-payload case it exists to fix.)
+- Codex#2 → ACCEPTED. Decision 2: park ADS1299 CS (+ any shared-DSPI slave-select) GPIO-output-HIGH
+  before bit-bang. Added a /grill risk that the analog frontend re-inits after card.init.
+- Codex#3 → ACCEPTED. Decision 2: release DSPI through the owning object; card.init must re-map PPS,
+  else sdBusRecover re-runs DSPI/PPS init before returning. Flagged as the highest-uncertainty point
+  for hardware verification in /grill.
+- Codex#4 + Gemini#2 → ACCEPTED. Decision 6: scan cap aligned to the resume namespace; after the loop
+  RE-CHECK fileSize()>0 and fail-fast (csHigh + return fileIsOpen) instead of removing the target.
+- Codex#5 + Gemini#3 → ACCEPTED. Decision 2: explicit SPI mode 0 (CPOL0/CPHA0, MSB-first, SCK idles
+  LOW, sample on rising edge); CMD12 discards the R1 stuff byte then parses R1/R1b.
+- No rejections this round (all findings were correct and actionable).
 ### prep.md changes this round
-Decisions 1-4 rewritten: state-keyed policy with `metaArmed`-gated `b` + IDLE-only `P`/`T` (1); hardened
-distinct escape replacing "no stop" (2); caller-side Layer-B guard (3); host fail-loud + drop `~~` (4).
-Assumption updated with the auto-resume-vs-escape fork (user to confirm). Plan: P0.2 expanded + P0.2b
-(escape spec); P1.1b (escape) + P1.5 mandatory; P3.2 adds `P`/premature-`b`/escape tests, P3.2b
-auto-resume, P3.2c acquisition invariant. Files/Risks updated.
+Decision 2 fully rewritten: SPI-mode-0 preamble; DSPI released via owning object + ADS1299 CS parked;
+6-step bounded abort with the NEW data-response-consume + MISO-high busy-wait before 0xFD; CMD12 stuff-
+byte handling; PPS re-acquire requirement. Decision 6: exhaustion re-check + fail-fast. Test-plan static-
+safety (a)/(d) updated. Risks: added the PPS re-acquire + ADS1299-reinit hardware-verification items.
 
 ## Round 5 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
-Convergent, implementation-level findings (both reviewers hit the same core issues → near-convergence).
-
+(Panel refining the R4 SD-protocol fixes — several findings CORRECT an R4 overcorrection.)
 ### Codex findings
-1. [BLOCKER] Escape must NOT call `streamStop()+closeSDfile()` from the recovery drain — latch an abort flag,
-   unwind to a safe top-level point (else re-enter SD/FAT/footer mid-error).
-2. [BLOCKER] Matcher must run after every RAW byte read (before P/T/M parsers consume bytes), + drain.
-3. [MAJOR] Escape token under-specified — use a concrete ≥8-byte non-printable token; test partial overlaps
-   + token-in-payload.
-4. [MAJOR] `M` still bypasses policy — gate to `SDfileOpen && !streaming && !metaArmed`; set metaArmed only
-   on the real META-complete path.
-5. [MAJOR] IDLE remains an untrusted destructive window — host must verify final rate/channels before start.
-6. [MAJOR] Host fail-loud too weak — flush stale input, require exact block count/file id, require META OK +
-   %START before declaring started.
-7. [MINOR] Prove no other direct `setupSDcard()` caller bypasses the guarded slot case.
-8. [MINOR] Flash trim order wrong — cut B=/debug text before `byteCounter=0`.
-9. [MINOR] Auto-resume+escape OK only after the blockers are fixed; else disabling auto-resume is simpler.
-
+1. [BLOCKER] CMD25 token-wait phase still fails — between 512-byte writes, 514 0xFF produce NO
+   data-response token, so "token timeout => fail-fast" never sends 0xFD. Fix: if no token + MISO high,
+   treat as between-packets and send 0xFD; only busy-wait after an actual busy indication.
+2. [MAJOR] Recovery after possible pre-recovery DSPI traffic — board.begin() brings up DSPI before
+   replaySessionFile; if SD_SS not GPIO-high first, ADS clocks hit a still-selected CMD25 card.
+   Fix: park SD_SS + ADS CS + shared CS high as raw GPIO before board.begin().
+3. [MAJOR] "prior slot clusters never touched" false mid-payload — the 514 drain programs the
+   interrupted sector with partial real + fill bytes → prior file tail has garbage/0xFF.
+   Fix: declare the interrupted sector sacrificial; verify collect_bci truncates/ignores invalid tail.
 ### Gemini findings
-1. [BLOCKER] RECORDING check must be `streaming && SDfileOpen` — else a PC-only GUI stream (no SD file)
-   can't be stopped (its `s` dropped).
-2. [BLOCKER] Stray `M` in HANDSHAKE after the legit %META re-enters `sdMetaProcess`, eats `b`/corrupts armed
-   state — gate `M` with `!metaArmed`.
-3. [MAJOR] Calling `closeSDfile()` from the recovery drain risks CMD12/FAT-mid-CMD25 hang/corruption — use
-   an `abortRequested` flag checked by `writeCache`, close at `loop()` top level.
-4. [MAJOR] `metaArmed`-requires-`M` breaks stock OpenBCI GUI SD start (GUI sends no `M`) — user must accept.
-5. [MINOR] Escape token of printable ASCII false-triggers if it appears in a session name (P/%META payload)
-   — use non-printable/control bytes the host filters.
-
-### Resolution (Claude) — all accepted; design now implementation-complete
-- **Gemini #3 / Codex #1 ACCEPTED → deferred `abortRequested` flag.** Matcher sets the flag; `writeCache`
-  early-returns on it; `loop()` does `streamStop()+closeSDfile()` at the safe top level. No re-entrant close.
-- **Codex #2 ACCEPTED → matcher fed every RAW byte before parsers** (+ recovery drain).
-- **Codex #3 / Gemini #5 ACCEPTED → ≥8-byte NON-PRINTABLE token** (host strips such bytes from text);
-  test token-in-payload/partial-overlap/burst.
-- **Gemini #1 ACCEPTED → RECORDING = `streaming && SDfileOpen`** (PC-only stream falls through to IDLE).
-- **Gemini #2 / Codex #4 ACCEPTED → gate `M` to `SDfileOpen && !streaming && !metaArmed`.**
-- **Gemini #4 ACCEPTED + flagged → SD recording now requires `%META` before `b`** (Decision 4b); stock-GUI
-  no-META SD start unsupported on this build (user drives via session_start). Coupled to the premature-`b` fix.
-- **Codex #5 / #6 ACCEPTED → host fail-loud strengthened** (drain stale, exact block-count/file-id, require
-  META OK + %START + start marker, re-assert rate/channels before `b`).
-- **Codex #7 ACCEPTED → P0.1 proves no other `setupSDcard` caller.** **Codex #8 ACCEPTED → trim order fixed**
-  (cut `B=`/text before the error-path one-liner).
-- **Codex #9 / Gemini auto-resume — noted:** keep auto-resume + escape (now that re-entrancy is fixed);
-  disable-auto-resume flagged as the simpler alternative for the user (assumption).
-
+1. [BLOCKER] Step-3 token-consumption race guarantees mid-payload recovery failure — the data-response
+   token is emitted DURING the step-2 drain, so a step-3 "consume token" times out and fail-fasts a
+   valid recovery. Fix: remove token parse; step 3 = pure bounded busy-wait for MISO HIGH (clocking 0xFF).
+2. [MAJOR] Busy-waits must actively clock the bus — polling MISO without toggling SCK won't advance the
+   card's state machine → permanent BUSY → timeout. Fix: all MISO-high waits loop sdBbByte(0xFF).
+3. [MAJOR] Pin-init glitch — pinMode(SCK,OUTPUT) while LAT is stale-HIGH emits a phantom clock. Fix:
+   digitalWrite(SCK,LOW)+digitalWrite(MOSI,HIGH) BEFORE the pinMode(...,OUTPUT) direction change.
+4. [MINOR] Leaked handle on exhaustion fail-fast — close the re-check SdFile before return fileIsOpen.
+### Resolution (Claude)
+ALL net-new and ALL correct. The two BLOCKERs (Codex#1 + Gemini#1) jointly CORRECT the R4 fix: my R4
+step 3 said "consume the data-response token then busy-wait", which both models showed is wrong —
+the token may have already passed during the drain (mid-payload) or never appear (between packets), so
+a parse/consume would fail-fast a valid recovery. Re-designed step 3 to a pure clock-and-wait-for-
+MISO-high with NO token parse; fail-fast ONLY on MISO-stuck-low. This is the right simplification.
+- Codex#1 + Gemini#1 → ACCEPTED. Decision 2 step 3 rewritten: no token consume; if MISO already high,
+  go straight to 0xFD; only busy-wait (clocking) while MISO low; token-absence is normal, not a fail.
+- Gemini#2 → ACCEPTED. Decision 2: ALL busy-waits explicitly loop sdBbByte(0xFF) while sampling MISO.
+- Gemini#3 → ACCEPTED. Decision 2 pin-setup: set latches (SCK LOW, MOSI/CS HIGH) BEFORE flipping TRIS.
+- Codex#2 → ACCEPTED. New Decision-2 bullet + Plan step: park SD_SS/ADS-CS high in DefaultBoard.ino
+  setup() BEFORE board.begin(). DefaultBoard.ino added to Files-to-touch.
+- Codex#3 → ACCEPTED (doc correction + verify, no firmware change). Decision 9 rewritten: interrupted
+  block is sacrificial (partial+0xFF), harmless because every night is already footerless; /grill
+  verifies collect_bci tolerates the partial+0xFF tail. Test plan got a collect_bci-tolerance item.
+- Gemini#4 → ACCEPTED. Decision 6: .close() the re-check handle before the fail-fast return.
+- No rejections this round.
 ### prep.md changes this round
-Decision 1: RECORDING=`streaming&&SDfileOpen`, `M` gated `!metaArmed`, matcher-before-parsers. Decision 2:
-deferred `abortRequested` flag + ≥8-byte non-printable token, never close in writeCache. Decision 4:
-strengthened host verification. New Decision 4b (GUI-compat trade-off). Assumption: two user confirms
-(auto-resume fork + %META-required). P0.1 no-other-caller; P0.2/P0.2b matcher+M-gate+abort-flag; P1 updated;
-P1.6 trim order; P3.2 escape tested in RECORDING/resumed/stall + non-trigger cases.
+Decision 2: glitch-free pin-init order; all busy-waits clock the bus; step 3 redesigned (no token
+parse, fail-fast only on MISO-stuck-low); new pre-board.begin() CS-park bullet. Decision 6: close
+re-check handle. Decision 9: sacrificial-block correction. Plan step 2 + Files-to-touch: DefaultBoard.ino
+CS-park. Test-plan static-safety rewritten (a-g) + collect_bci tail-tolerance verify item.
 
 ## Round 6 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
-Both converged on the SAME two BLOCKERs (strong signal these are the last real issues).
-
+(Findings now deep PIC32-silicon specifics; one BLOCKER (PPS) is critical + genuinely new.)
 ### Codex findings
-1. [BLOCKER] `metaArmed` breaks auto-resume — replay sends no `M`, so its `b` is dropped. Arm `metaArmed`
-   on the trusted replay path (or persist/replay `%META`).
-2. [BLOCKER] Abort early-return under-specified — if seen at `byteCounter==512`, a bare return recreates the
-   overflow; force a safe unwind (no further appends, sanitize `byteCounter`, one top-level writeStop/cleanup).
-3. [MAJOR] Host "re-assert rate/channels before b" conflicts with HANDSHAKE deny — move the assert to before
-   the slot char (IDLE).
-4. [MINOR] Token must be `uint8_t[]` w/ explicit length (not signed-char/C-string); clear `abortRequested`
-   after a completed abort.
-
+1. [MAJOR] DSPI/GPIO takeover not proven interrupt-safe — an ADS DRDY ISR / timer / bg SPI user could
+   re-enter DSPI while pins are raw GPIO. Fix: mask the ADS/SPI interrupt around recovery; if masking
+   global ints, don't use millis() for bounds.
+2. [MAJOR] Busy-low timeouts too short — 250/500ms can misclassify a programming card as dead. Fix:
+   base MISO-low waits on SdFat write/erase timeout constants / seconds-scale bound.
+3. [MAJOR] setupSDcard fail-fast must close/reset openfile — a partially-created file object must be
+   closed before return, not just CS deasserted.
+4. [MINOR] CMD12 result must be explicitly non-fatal — illegal/no-op after CMD25 0xFD; fail only on
+   MISO-stuck-low, not on CMD12 R1.
 ### Gemini findings
-1. [BLOCKER] `writeCache` early-return during the busy-drain leaves the SD BUSY/MISO low → loop()'s CMD12/
-   FAT close fails/corrupts. `writeCache` must wait for SD BUSY to clear before returning on abort.
-2. [BLOCKER] `replaySessionFile()` drops its own `b` (false `metaArmed`) → resumed session silently fails.
-   Set `metaArmed = true` in `replaySessionFile()`.
-3. [MAJOR] Escape unreachable via WiFi/Serial1 during a stall — the drain only polls Serial0. Poll all
-   active ingress ports.
-4. [MINOR] Inlining the matcher at 4 sites risks the flash margin — single non-inlined helper.
-
-### Resolution (Claude) — verified replay path in source; all accepted
-- **Codex #1 / Gemini #2 ACCEPTED — verified.** `replaySessionFile` (951-959) feeds bytes DIRECTLY to
-  `sdProcessChar`+`board.processChar` (bypasses `dispatchCommandByte`) and is a TRUSTED source (host-written
-  SESSION.TXT), so the replayed `b` is not subject to the `metaArmed` gate → resume works. Also set
-  `metaArmed=true` in replay defensively. The escape still fires for a resumed session (raw-byte ingress).
-- **Codex #2 / Gemini #1 ACCEPTED — safe-abort contract.** `abortRequested` is acted on ONLY at an SD block
-  boundary (top of `writeCache` before `writeData`; top of `loop()`); suppress all further `pCache` appends
-  (no `byteCounter==512` recurrence); `loop()` runs ONE `streamStop()`+`closeSDfile()` (its `writeStop()`
-  polls SD BUSY) then CLEARS the flag. Never close inside `writeCache`/the drain.
-- **Codex #3 ACCEPTED** — host re-asserts final rate/channels in IDLE BEFORE the slot char (handshake denies them).
-- **Codex #4 ACCEPTED** — `uint8_t token[]` explicit length; clear `abortRequested` post-abort.
-- **Gemini #3 ACCEPTED (scoped)** — drain feeds the matcher from all active transports (Serial0 for this user).
-- **Gemini #4 ACCEPTED** — single non-inlined matcher helper.
-
+1. [BLOCKER] Spurious clock on DSPI release — SPI.end() BEFORE setting latches/dirs snaps pins to stale
+   LAT/TRIS → phantom SCK edge. Fix: write idle latches + set directions BEFORE clearing the DSPI ON bit.
+2. [BLOCKER] PPS hijacking MOSI — on MX250 MOSI=SDO1 is PPS-routed; SPI.end() does NOT release PPS, so
+   digitalWrite(MOSI) is overridden by the disabled peripheral → bit-bang clocks all zeros → 0xFD/CMD12
+   never sent. Fix: clear the PPS output map for SDO1 (RPxnR=0) before bit-banging; card.init re-maps it.
+3. [MINOR] CMD12 R1 stuff-byte fragility — cards send 0/1/many idle bytes; blind 1-byte discard can eat
+   the real R1. Fix: clock until a byte with MSB=0 (bounded ~8) to capture R1 robustly.
+4. [MINOR] Residual FAT-corruption race — ACKNOWLEDGED as user-accepted (delay-only). No action.
+### Resolution (Claude)
+ALL net-new and correct. Gemini#2 (PPS) is the most important catch of the entire review: it would make
+the whole recovery a silent no-op on real silicon (bit-bang would clock zeros). Both BLOCKERs are about
+the PIC32 DSPI->GPIO handover, which is genuinely subtle hardware sequencing.
+- Gemini#2 → ACCEPTED. Decision 2 pin-handover step 3: clear the PPS output map for MOSI/SDO1 (RPxnR=0)
+  so LAT drives the pin; card.init re-establishes PPS. Flagged as the single highest-risk step, /grill
+  HW-verifies the exact register sequence.
+- Gemini#1 → ACCEPTED. Decision 2 reordered to explicit 4-step register sequence: latches FIRST → TRIS
+  → clear PPS → THEN disable module (so disabling can't snap a stale LAT/TRIS into a phantom clock).
+- Codex#1 → ACCEPTED. New Decision-2 bullet: mask the ADS DRDY/SPI ISR (specific int, not global di so
+  millis() runs) across recovery; /grill confirms no ISR touches DSPI in the window.
+- Codex#2 → ACCEPTED. Decision 2: MISO-low programming waits use a conservative seconds-scale bound
+  (~2s, aligned to SD_WRITE_TIMEOUT) so a programming card is never misread as dead; drain stays short.
+- Codex#3 → ACCEPTED. Decision 5: openfile.close() on the fail-fast path before csHigh+return.
+- Codex#4 + Gemini#3 → ACCEPTED. Decision 2 step 5: CMD12 best-effort, find R1 by MSB=0 scan (bounded
+  8), never fail recovery on CMD12 R1, only on MISO-stuck-low.
+- Gemini#4 → no action (confirms user-accepted residual risk).
+- No rejections.
 ### prep.md changes this round
-Decision 1: added the REPLAY-bypass + `metaArmed=true`-in-replay bullet; IDLE config-verify-before-slot-char.
-Decision 2: full safe-abort contract (block-boundary action, suppress appends, one top-level close, clear
-flag, BUSY-wait via writeStop, all-transport drain, single `uint8_t[]` helper). Decision 4: re-assert config
-in IDLE not pre-`b`. Plan P0.2(e)/P1.1/P1.1b updated.
+Decision 2: pin-handover rewritten to the explicit PIC32 PPS-aware 4-step register sequence + ISR-mask
+bullet + seconds-scale MISO-low bound; step 5 CMD12 made best-effort with MSB=0 R1 scan. Decision 5:
+close openfile on fail-fast. Test-plan static-safety rewritten (a-i).
 
-## Round 7 — Codex: APPROVED | Gemini: CHANGES_REQUESTED (1 net-new BLOCKER)
-Codex APPROVED (only a MINOR note that it couldn't re-read source — already covered by P0.6). Gemini found
-one genuine net-new BLOCKER.
-
-### Gemini finding
-1. [BLOCKER] `writeFooter` overflows `pCache` during escape abort. `loop()`'s abort → `closeSDfile()` →
-   `writeFooter()` appends ~100-218 B to `pCache` via the bare `pCache[byteCounter++]` pattern (no bounds
-   check). If the abort fires at non-zero `byteCounter`, and `writeCache`'s abort early-return does NOT reset
-   `byteCounter`, `writeFooter` walks past `pCache[512]` → RAM corruption. The "suppress appends in the
-   sample path" approach is fragile (misses `writeFooter`). FIX: `writeCache`'s abort early-return MUST do
-   `byteCounter = 0;` — absorbs all oblivious caller writes safely.
-
-### Resolution (Claude) — ACCEPTED (correct, concrete, trivial)
-Gemini is right: the existing `sdCardDead` early-return (1666) already does `byteCounter=0` for exactly this
-reason; the abort early-return must mirror it. Added to Decision 2's safe-abort contract + P1.1b: `writeCache`'s
-abort early-return sets `byteCounter=0`; abort may also skip `writeFooter` (footer-less partial file is valid)
-as belt. Closed even though we hit the nominal 7-round backstop — a known RAM-corruption blocker overrides the
-round cap; the fix is one line and Codex already approved the rest.
-
+## Round 7 — Codex: APPROVED | Gemini: APPROVED  ✅ CONVERGED
+(Final backstop round. Both approve; only MINORs remain.)
+### Codex findings
+1. [MINOR] Plan step 1 shorthand "DSPI-disable + pinMode first" is looser than the required
+   latch→TRIS→clear-PPS→disable-module order in Decision 2/test-plan. Implementation should follow
+   the detailed order. → FIXED: Plan step 1 reworded to point at the exact Decision-2 order.
+### Gemini findings
+1. [MINOR] CMD12 R1 scan bound — extend ~8 → ~16 bytes so a non-compliant/wedged card has margin to
+   return R1 (CMD12 is best-effort + non-fatal anyway; costs microseconds). → FIXED: bound raised to ~16.
+### Resolution (Claude)
+BOTH APPROVED. Two trivial MINORs, both accepted and applied. No BLOCKER/MAJOR. /prep converges at
+round 7 (the planning backstop). The approach is signed off by both independent reviewers.
 ### prep.md changes this round
-Decision 2 safe-abort contract: added the `byteCounter=0`-in-abort-early-return as the bulletproof guard (vs
-the fragile sample-path suppression) + skip-writeFooter option. P1.1b updated to match.
-
-## Round 8 — Codex: CHANGES_REQUESTED | Gemini: APPROVED
-Gemini APPROVED (confirmed the `byteCounter=0` reset fully closes the `writeFooter` overflow; auto-resume +
-escape mechanics sound, no net-new blockers). Codex found one refinement of the SAME RAM-safety item.
-
-### Codex finding
-1-2. [BLOCKER] The `byteCounter=0`-in-`writeCache` only helps if `writeCache` runs before `closeSDfile`.
-   `loop()`'s top-level abort path can call `closeSDfile()` directly (escape matched during normal RX) with a
-   nonzero partial `pCache`. Make cache sanitation mandatory on EVERY abort-close path: force `byteCounter=0`
-   there too and/or make the footer-skip mandatory so no `pCache` appender runs.
-
-### Resolution (Claude) — ACCEPTED (single airtight abort path)
-Defined ONE `performAbort()` helper invoked only from `loop()` top-level: `byteCounter=0` → `streamStop()` →
-`closeSDfile()` with `writeFooter` MANDATORILY skipped → clear `abortRequested`. `closeSDfile` itself doesn't
-append to `pCache`. So no oblivious appender runs on the abort path from any entry point — closes Codex's gap.
-
-### prep.md changes this round
-Decision 2: replaced "may skip writeFooter" + scattered resets with a single `performAbort()` helper
-(byteCounter=0 + mandatory footer-skip + streamStop + closeSDfile + clear flag), called only from loop() top.
-
-## Round 9 — Codex: APPROVED | Gemini: APPROVED ✅ (both, no BLOCKER/MAJOR remaining)
-Both reviewers confirmed the single top-level `performAbort()` (byteCounter=0 + mandatory footer-skip +
-closeSDfile-doesn't-append + writeStop's CMD12 BUSY-safe close) fully closes the abort-overflow concern from
-every entry path, with no remaining holes for overnight recording, escape/abort, or auto-resume.
-
-**FINAL: plan APPROVED by Codex AND Gemini after 9 rounds.** prep.md is the deliverable. Two workflow
-decisions remain for the USER (not the panel): (1) keep auto-resume + escape vs disable auto-resume;
-(2) accept that SD recording now requires %META before `b` (stock-GUI no-META SD start unsupported).
-Next: user confirms those two, then /grill implements.
+Plan step 1 wording aligned to the exact Decision-2 handover order; CMD12 R1 scan bound ~8 → ~16 bytes.
