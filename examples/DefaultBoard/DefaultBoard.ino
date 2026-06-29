@@ -49,6 +49,11 @@ void feedEscape(uint8_t c);             // escape detector — fed every raw inb
 void dispatchCommandByte(char c);          // recording-state-keyed command policy
 void performAbort();                    // safe top-level abort-close (escape stop)
 
+// SPIROV-overrun hang fix (prep.md, 2026-06-29): the sticky SPI-bus fault latch + the
+// atomic SPI-module flush, both defined in the OBCI32_SD fork (Sd2Card.cpp).
+extern volatile uint8_t sdSpiFault;     // set by a bounded SPI primitive on SPIROV/deadline bail
+extern void sdSpiModuleFlush(void);     // atomic SPI1 flush (FIFO + SPIROV); CLEARS sdSpiFault
+
 void setup() {
   // Capture MCU reset cause BEFORE anything that might touch RCON. Then clear
   // the sticky bits so the next reset's cause is unambiguous. NOTE: on the
@@ -127,6 +132,13 @@ void loop() {
   // Service a hardened-escape abort at a safe top-level point (the matcher only sets the
   // flag; closing here, between SD block writes, avoids any mid-CMD25 re-entrancy).
   if (abortRequested) performAbort();
+
+  // ADS-path guard (prep.md Layer 1c / Decision 10): if a bounded SPI primitive latched a
+  // bus fault on a terminal/non-writeCache path (cardCommand, FAT op, footer, close), flush
+  // the SPI module here — at a safe block boundary — so the next ADS read never runs on a
+  // poisoned bus. Mode-safe (the masked-CON flush preserves the active SPI mode), and a no-op
+  // on a clean bus (the common case — writeCache's SPIROV branch already cleared the latch).
+  if (sdSpiFault) sdSpiModuleFlush();
 
   if (board.streaming) {
     if (board.channelDataAvailable) {

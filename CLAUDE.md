@@ -142,6 +142,67 @@ stitches `OBCI_5A`+`OBCI_5B`), not prevention. Key facts that shaped it:
   the user's flash + an overnight sleep test (a mid-night external reset cannot be reproduced on the
   bench). Flash with the normal `pic32prog` invocation above (NEVER a kill-timeout).
 
+## SPIROV mid-write FREEZE fix (2026-06-29) — built + Codex+Gemini APPROVED, NOT yet flashed
+Branch `grill/cyton-sd-recover`. Cures the **intermittent overnight FREEZE** (recording halts
+mid-night, board dead until power-cycle; the file ends mid-sample with CLEAN normal-range EEG — NOT
+power loss). **Root cause (register-level):** the 512-byte SD block write uses DSPI's **ENH_BUFFER**
+(8-byte RX FIFO) bulk transfer whose `while(toWrite||toRead)` drain loop is **UNBOUNDED**. A DRDY-ISR
+delay mid-loop overruns the RX FIFO → `SPI1STAT.SPIROV` latches → received bytes are lost → `toRead`
+never reaches 0 → **infinite spin inside `card.writeData()`**. This is a *different* failure from the
+2026-06-28 0-byte-next-slot (that was an external mid-CMD25 reset; the salvage path above handles it).
+
+**The fix — bounded, FIFO-safe SPI in the OBCI32_SD fork (out-of-repo `~/Arduino/libraries/
+OpenBCI_32bit_SD/utility/Sd2Card.cpp`; archived in this repo as `patches/sd2card-spirov-fix.cpp` +
+`patches/sd2card-spirov-fix.patch`):**
+- `spiByteBounded(out)` — single-byte (standard mode, ENHBUF=0) transfer, CP0-deadline bounded; on
+  deadline latches sticky `sdSpiFault` + returns 0xFF. `spiRec`/`spiSend` route through it.
+- `spiBlockBounded(src,n)` — replaces writeData's `_spi->transfer(512,src)`. DSPI ENH_BUFFER bulk loop
+  but **caps in-flight bytes** (`(toRead-toWrite) < sdFifoHeadroom`, default 7, on the 8-deep RX FIFO)
+  with eager draining so the FIFO can't overrun under ISR jitter, PLUS a `SPI1STAT.SPIROV` check + a
+  no-progress CP0 deadline as the infinite-spin backstop. On bail: latch `sdSpiFault`, return false.
+- `sdSpiModuleFlush()` — atomic SPI1 flush: ON→0 (readback) → clear ENHBUF/MODE16/MODE32 (only legal
+  while ON==0) → clear SPIROV → ON→1 (readback). Preserves mode/CKE/CKP/MSTEN/BRG; clears `sdSpiFault`.
+- Sticky `sdSpiFault` latch + fault short-circuits in cardCommand / waitNotBusy / waitStartBlock /
+  readData (bounded per-byte) / readRegister / writeData.
+- **writeCache SPIROV recovery branch** (`SD_Card_Stuff.ino`): on a faulted `writeData`, `sdBusRecover()`
+  (made live-safe — flushes first, bounded pokes) does the live CMD25 abort → `card.init` → `writeStart`
+  → same-block retry of the preserved `pCache`. Non-SPIROV failures take the existing bare retry
+  (byte-identical). A unified `if(!ok && sdSpiFault) sdBusRecover()` guards the skip-forward tail.
+- **Layer 1c** (`DefaultBoard.ino`): a top-of-loop `if (sdSpiFault) sdSpiModuleFlush();` ADS-path guard.
+
+**⚠ THE REAL FLASH CEILING IS 118784 B, NOT 122880.** arduino-cli reports "122880 max", but the linker
+script `chipKIT-application-32MX250F128.ld` defines `kseg0_program_mem = 0x1D000 = 118784 B` — a 4 KB
+DEE-EEPROM page (0x1E000) + a 4 KB splitflash page (0x1F000) are carved off the top. So the `38b3896`
+baseline (118600 B) had only **~184 B free**, not the ~4280 the prep assumed. At 96% **fragmented**-full
+the chipKIT `-ffunction-sections` allocator can't grow any function's section past its gap → even a
+~10 B add fails to link.
+
+**SCOPE CUT (user decision — flash budget):** shipped the **SPIROV fix ONLY**. **DROPPED** the entire
+`prep-diag.md` diagnostics layer (`%CKPT s=`, the `ps`/`pf` EEPROM freeze-breadcrumb, `%BOOT` decode,
+tune keys 0x07–0x0A, the synthetic-SPIROV self-test), **`prep.md` Layer 2 soft-WDT**, and **Layer 3
+WDTPS readout** — none fit, and none is the diagnosed cause. EEPROM map UNCHANGED from `38b3896`.
+
+**HOST-CONTRACT-SAFE flash reclamation (verified, NOT assumed):** trimmed `writeFooter()` to emit ONLY
+the `\n%Total time mS:\n` clean-stop marker. **Codex round-2 correctly caught** that the old footer
+wrote `%SamplingFreq` *before* `%Total time`, so "host breaks at %Total time" didn't cover it — traced
+BOTH host parsers (`py-qs-data/openbci_functions.py` = the live collect-bci ingest; `openbci-session/
+sd_convert.py`): the ingest loop **breaks at a line starting `%Total time`**, so every other dropped
+field (min/max/over/err/retry/reinit/extRetry/block, all *after* the break) was never parsed; and **no
+host code reads the `%SamplingFreq` token** (its old before-break line was only mis-ingested as a benign
+phantom EOF "stop"). EEG samples are byte-identical. The `%CKPT t/b/e/r/n/o/x` parser is
+order-independent key=value — `o=` (`overruns`) is KEPT (sd_health reads it).
+
+**Build 118360 B (96%, ~424 B free under the 118784 ceiling), RAM 11552 B (35%).** Normal no-fault
+recordings are byte-identical except the trimmed footer (host never parsed it). Audit:
+`grill-review-log.md` "Grill #2" — 4 grill-time decisions + **3 Codex+Gemini review rounds, both
+APPROVED at R3**. Notable catches: R1 unbounded readData/readRegister/waitNotBusy fault gaps (fixed);
+R2 the `%SamplingFreq` justification gap (resolved by host-parser proof) + a redundant-flush MINOR
+(fixed) + a Gemini BLOCKER that was a diff-generation artifact (the round-1 fixes were present; the
+reviewed baseline diff was incomplete — regenerated). ⚠ **NOT flashed** — final verification is the
+user's flash + overnight `-a 20` sleep test + an `-a 22` 1000 Hz throughput test (the multi-hour freeze
+is only reproducible on a real overnight run). Flash with the normal `pic32prog` invocation above
+(**NEVER a kill-timeout** — that bricked Cyton A; let it run to "Verify flash … done").
+
 ## Verified behaviour (2026-06-24, on hardware)
 Stray `F`/`j`/`s`/`1` ignored mid-stream (`B` held); auto-resume after power-cycle (×3, clean);
 `session_start.py --stop` round-trip; 45-min endurance run cleared block 101,340 with `B=2432000`

@@ -7,7 +7,6 @@
 #define BLOCK_12HR   (BLOCK_1HR*12)  
 #define BLOCK_24HR   (BLOCK_1HR*24) 
 
-#define OVER_DIM      20 // make room for up to 20 write-time overruns
 #define ERROR_LED     false
 #define OK_LED        true
 
@@ -36,12 +35,7 @@ boolean fileIsOpen = false;
 uint8_t BLOCK_DIV = 1;          // DEFAULT VALUE
 boolean sdBlockDivManual = false; // true if host sent explicit 'c'/'C' override
 
-struct {
-  uint32_t block;   // holds block number that over-ran
-  uint32_t micro;  // holds the length of this of over-run
-} over[OVER_DIM];
-
-uint32_t overruns;      // count the number of overruns
+uint32_t overruns;      // count slow block-writes (> MICROS_PER_BLOCK) -> %CKPT o= (sd_health reads it)
 uint32_t sdErrs = 0;    // failed card.writeData() calls (SD multi-block hiccups)
 uint32_t sdRetries = 0; // writeStop+writeStart recovery attempts issued
 uint8_t  sdMetaState = 0;   // 0=idle, 1=need-len-lo, 2=need-len-hi, 3=copying payload, 4=draining bad len
@@ -174,8 +168,6 @@ uint32_t sdLastCkptMs  = 0;         // last %CKPT emit time (millis()); soft-WDT
                                     // is being called with samples (ISR alive + writeCache
                                     // returning). Checked from loop() in DefaultBoard.ino
                                     // against max(SOFT_WDT_FLOOR_MS, 2× tuneCkptIntervalMs).
-uint32_t maxWriteTime;  // keep track of longest write time
-uint32_t minWriteTime;  // and shortest write time
 uint32_t t;        // used to measure total file write time
 uint8_t ERROR_BLINKS = 3;
 uint8_t OK_BLINKS    = 3;
@@ -183,16 +175,20 @@ uint8_t OK_BLINKS    = 3;
 
 byte fileTens, fileOnes;  // enumerate succesive files on card and store number in EEPROM
 char currentFileName[] = "OBCI_00.TXT"; // file name will enumerate in hex 00 - FF
-prog_char samplingFreq[] PROGMEM = {"\n%SamplingFreq:\n"};  // 16
-prog_char elapsedTime[] PROGMEM = {"%Total time mS:\n"};  // 17
-prog_char minTime[] PROGMEM = {  "%min Write time uS:\n"};  // 20
-prog_char maxTime[] PROGMEM = {  "%max Write time uS:\n"};  // 20
-prog_char overNum[] PROGMEM = {  "%Over:\n"};               //  7
-prog_char errStamp[] PROGMEM = { "%Errors:\n"};             //  9
-prog_char retryStamp[] PROGMEM = { "%Retries:\n"};          // 10
-prog_char reinitStamp[] PROGMEM = { "%Reinits:\n"};         // 10
-prog_char extRetryStamp[] PROGMEM = { "%ExtRetries:\n"};    // 13 (added 2026-05-13)
-prog_char blockTime[] PROGMEM = {  "%block, uS\n"};         // 11    74 chars + 2 32(16) + 2 16(8) = 98 + (n 32x2) up to 24 overruns...
+// Flash-reclaim 2026-06-29: dropped the footer-only PROGMEM strings (samplingFreq/minTime/
+// maxTime/overNum/errStamp/retryStamp/reinitStamp/extRetryStamp/blockTime). Host-parser audit
+// (py-qs-data/openbci_functions.py + openbci-session/sd_convert.py): the ingest loop BREAKS at a
+// line starting "%Total time", so minTime/maxTime/overNum/err/retry/reinit/extRetry/blockTime
+// (all emitted AFTER %Total time in the old footer) were never parsed. samplingFreq was the lone
+// field emitted BEFORE the break — but no host code reads the "%SamplingFreq" token; it was only
+// mis-ingested as a benign phantom EOF "stop" marker, so dropping it is neutral-to-cleaner.
+// Error/retry counts live live+cumulative in every %CKPT line. (Codex review #1 round 2.)
+prog_char elapsedTime[] PROGMEM = {"\n%Total time mS:\n"};  // 17 chars (clean-stop marker — KEEP).
+// LEADING \n is REQUIRED: writeFooter runs with byteCounter possibly mid-line, and the host
+// (sd_convert.process_file) detects the clean stop by a line that STARTS with "%Total time".
+// The dropped samplingFreq string used to carry this leading \n. The writeFooter loop copies
+// exactly 17 chars (this string, NO trailing null) so the marker always starts a fresh line.
+// (Codex review #4 — missing line-start; Gemini review #3 — no null injection.)
 prog_char stopStamp[] PROGMEM = {  "%STOP AT\n"};      // used to stamp SD record when stopped by PC
 prog_char startStamp[] PROGMEM = {  "%START AT\n"};    // used to stamp SD record when started by PC
 
@@ -747,20 +743,34 @@ void applyTuneTextLine(const uint8_t* buf, uint16_t len) {
 // power rail settle after an external glitch so the FAT mutation starts on stable power — a bounce
 // DURING the delay just resets the MCU again before any FAT write, instead of corrupting it.
 #define SD_RESUME_STABILIZE_MS  2500UL
+
+// Bounded, FIFO-safe SPI primitives + module flush + sticky fault latch — defined in the
+// OBCI32_SD fork (Sd2Card.cpp), the SPIROV-overrun hang fix (prep.md, 2026-06-29). The
+// fork talks to SPI1 directly; these let the sketch's recovery paths drive the bus with
+// the same bounded primitives + see/clear the fault latch.
+extern volatile uint8_t sdSpiFault;     // sticky: set by a bounded primitive on SPIROV/deadline bail
+extern void    sdSpiModuleFlush(void);  // atomic SPI1 flush (FIFO + SPIROV); CLEARS sdSpiFault
+extern uint8_t spiByteBounded(uint8_t); // bounded single-byte transfer (latches sdSpiFault on deadline)
+
 static void sdBusRecover(){
+  // Live-safe (prep.md Decision 9): flush the SPI module FIRST — clears any latched SPIROV +
+  // the sdSpiFault latch (else the bounded pokes below would entry-short-circuit to no-ops),
+  // and leaves the module clean before we re-drive the bus. Mode/BRG preserved.
+  sdSpiModuleFlush();
   board.csLow(SD_SS);                          // MODE0, 20 MHz, CS low — select the card
   // 1. Finish any partial CMD25 data block: clock a full packet worth (512 data + 2 CRC + margin)
   //    so a card stuck mid-payload reaches its data-response/token-wait state. On an idle/healthy
-  //    card these are just ignored 0xFF clocks (harmless).
-  for (uint16_t i = 0; i < 520; i++) board.spi.transfer(0xFF);   // 512 + 2 + 6 margin
+  //    card these are just ignored 0xFF clocks (harmless). Bounded pokes: a still-wedged bus
+  //    latches sdSpiFault and we bail immediately instead of paying 520× the per-byte deadline.
+  for (uint16_t i = 0; i < 520; i++) { spiByteBounded(0xFF); if (sdSpiFault) break; }   // 512 + 2 + 6 margin
   // 2. Wait out programming-BUSY (card holds MISO low -> transfer returns 0x00) BEFORE the stop
   //    token: a 0xFD sent during BUSY is ignored. Clock 0xFF continuously while polling. Bounded.
   uint32_t t0 = millis();
-  while ((uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && board.spi.transfer(0xFF) != 0xFF) {}
+  while (!sdSpiFault && (uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && spiByteBounded(0xFF) != 0xFF) {}
   // 3. Stop-tran token ends the multi-block write; wait out its programming-BUSY.
-  board.spi.transfer(0xFD);
+  spiByteBounded(0xFD);
   t0 = millis();
-  while ((uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && board.spi.transfer(0xFF) != 0xFF) {}
+  while (!sdSpiFault && (uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && spiByteBounded(0xFF) != 0xFF) {}
   // NOTE: 0xFD is the correct AND sufficient stop for an SPI multi-block WRITE (CMD25), which is the
   // only multi-block transfer this firmware ever issues during recording — so the wedge is always a
   // stuck CMD25. A CMD12 (which aborts a multi-block READ, CMD18) was considered and intentionally
@@ -768,9 +778,9 @@ static void sdBusRecover(){
   // that complete before recovery runs), so CMD12 would guard an impossible state — and the flash
   // budget (~4 KB) is better spent elsewhere. Both review models confirmed CMD12 is not required for
   // CMD25 recovery. If a future change adds multi-block reads, restore a best-effort CMD12 here.
-  // 4. Release the bus: CS high + trailing idle clocks.
+  // 4. Release the bus: CS high + trailing idle clocks (bounded).
   board.csHigh(SD_SS);
-  for (uint8_t i = 0; i < 16; i++) board.spi.transfer(0xFF);
+  for (uint8_t i = 0; i < 16; i++) { spiByteBounded(0xFF); if (sdSpiFault) break; }
 }
 
 // Best-effort SD writer for a tiny REPLAYFL.TXT forensic file. Called from
@@ -1406,8 +1416,6 @@ boolean setupSDcard(char limit){
   // does its own card.init() if needed (see writeCache).
   sdCardDead = false; sdReinits = 0; sdExtRetries = 0; sdLastCkptMs = millis();
   sdMetaCorrupted = false; sdPendingErrs = 0;  // clear META flags from any prior dead-card event
-  maxWriteTime = 0;
-  minWriteTime = 65000;
   byteCounter = 0;  // counter from 0 - 512
   blockCounter = 0; // counter from 0 - BLOCK_COUNT;
 
@@ -1933,6 +1941,12 @@ void writeCache(){
 
     uint32_t tw = micros();  // start block write timer
     boolean errOccurred = false;
+    // NOTE (prep.md Layer 4 dropped): a synthetic-SPIROV bench self-test does NOT fit — at
+    // 96% fragmented-full flash, ANY added code grows a function's section past its gap and the
+    // chipKIT allocator can't place it (verified: even a ~10 B debug arm fails to link). The
+    // SPIROV fix is therefore validated by: the Codex+Gemini review of this recovery code, the
+    // 1000 Hz throughput test (proves the bounded FIFO-safe primitives hold under load), and
+    // the overnight sleep test. See grill-review-log.md / CLAUDE.md.
     board.csLow(SD_SS);  // take spi
     boolean ok = card.writeData(pCache);
     if (!ok) {
@@ -1943,10 +1957,36 @@ void writeCache(){
       // sdRetries counts attempts issued (successful or not) so the footer
       // counter matches the number of recovery cycles the firmware ran.
       sdRetries++;
-      card.writeStop();
-      if (card.writeStart(bgnBlock + blockCounter, BLOCK_COUNT - blockCounter)) {
-        ok = card.writeData(pCache);  // capture retry result
+      if (sdSpiFault) {
+        // === SPIROV recovery (prep.md Layer 1b / Decision 8) — THE freeze fix ===
+        // The 512-byte block write latched SPI1STAT.SPIROV: the host RX FIFO overran
+        // mid-CMD25, the card is desynced, and a bare writeStop's lone 0xFD would be
+        // eaten as a data byte (no recovery). Instead run the live CMD25 abort:
+        // sdBusRecover() FIRST flushes the SPI module (clears the host FIFO + SPIROV +
+        // the sdSpiFault latch so the following primitives run), then does the 520-dummy
+        // flush + STOP_TRAN. Then re-init the card and retry the SAME block from pCache.
+        // (No standalone sdSpiModuleFlush() here — sdBusRecover's first act IS that flush;
+        // Gemini review #2 round 2.)
+        sdBusRecover();
+        if (card.init(SPI_FULL_SPEED, SD_SS) &&
+            card.writeStart(bgnBlock + blockCounter, BLOCK_COUNT - blockCounter)) {
+          ok = card.writeData(pCache);   // same-block retry of the preserved 512 B
+        }
+      } else {
+        // === non-SPIROV failure: existing bare same-block boundary retry (BYTE-IDENTICAL) ===
+        card.writeStop();
+        if (card.writeStart(bgnBlock + blockCounter, BLOCK_COUNT - blockCounter)) {
+          ok = card.writeData(pCache);  // capture retry result
+        }
       }
+      // If STILL failed AND the bus is now faulted — a SPIROV at the first write, OR a CP0
+      // deadline latched DURING either retry path (Codex review #3: even the non-SPIROV bare
+      // retry's writeStop/writeStart/writeData can itself wedge) — CMD25-abort the
+      // (possibly mid-CMD25) bus BEFORE the skip-forward tail, whose bare writeStop's lone 0xFD
+      // would otherwise be eaten as a data byte and desync the card. sdBusRecover() flushes the
+      // SPI module first (clearing sdSpiFault so the tail's bounded primitives run); if the card
+      // is truly dead they re-latch -> sdCardDead. (No standalone flush — Gemini review #2 r2.)
+      if (!ok && sdSpiFault) { sdBusRecover(); }
       if (!ok) {
         // Persistent failure on the original block. Skip forward to the next
         // block so subsequent writes target the right position. Retry the
@@ -2112,15 +2152,10 @@ void writeCache(){
     }
     board.csHigh(SD_SS);  // release spi
     tw = micros() - tw;      // stop block write timer
-    if (tw > maxWriteTime) maxWriteTime = tw;  // check for max write time
-    if (tw < minWriteTime) minWriteTime = tw;  // check for min write time
-    if (tw > MICROS_PER_BLOCK) {      // check for overrun
-    if (overruns < OVER_DIM) {
-        over[overruns].block = blockCounter;
-        over[overruns].micro = tw;
-      }
-      overruns++;
-    }
+    // Flash-reclaim 2026-06-29: dropped min/max-write-time + the per-overrun over[] detail
+    // list (footer-only, host never parsed them). KEEP the `overruns` count — it is the
+    // %CKPT `o=` field that sd_health.py consumes.
+    if (tw > MICROS_PER_BLOCK) overruns++;   // count slow block-writes -> %CKPT o=
 
     byteCounter = 0; // reset 512 byte counter for next block
     blockCounter++;    // increment BLOCK counter
@@ -2210,74 +2245,19 @@ void stampSD(boolean state){
 
 
 void writeFooter(){
- 
-  for(int i=0; i<16; i++){
-    pCache[byteCounter] = pgm_read_byte_near(samplingFreq+i);
-    byteCounter++;
-  }
-  String daqFreq = board.getSampleRate();
-  convertToHex(daqFreq.toInt(), 4, false);
-  
+  // Flash-reclaim 2026-06-29 (SPIROV-fix flash): the footer is trimmed to JUST the
+  // "%Total time mS:" line. The host parser (sd_convert.process_file) BREAKS its read
+  // loop the instant it sees a line starting with "%Total time", so EVERY field that
+  // used to follow it (%SamplingFreq/%min/%max Write/%Over/%block+overrun list/
+  // %Errors/%Retries/%Reinits/%ExtRetries) was NEVER parsed — and the error/retry
+  // counts are already carried live + cumulative in every %CKPT line (e=/r=/n=/x=).
+  // So only the "%Total time" LABEL matters: it is the clean-stop marker. Keep it.
+  // ⚠ HOST CONTRACT — keep the "%Total time" line (its label is the clean-stop marker).
   for(int i=0; i<17; i++){
     pCache[byteCounter] = pgm_read_byte_near(elapsedTime+i);
     byteCounter++;
   }
   convertToHex(t, 7, false);
-
-  for(int i=0; i<20; i++){
-    pCache[byteCounter] = pgm_read_byte_near(minTime+i);
-    byteCounter++;
-  }
-  convertToHex(minWriteTime, 7, false);
-
-  for(int i=0; i<20; i++){
-    pCache[byteCounter] = pgm_read_byte_near(maxTime+i);
-    byteCounter++;
-  }
-  convertToHex(maxWriteTime, 7, false);
-
-  for(int i=0; i<7; i++){
-    pCache[byteCounter] = pgm_read_byte_near(overNum+i);
-    byteCounter++;
-  }
-  convertToHex(overruns, 7, false);
-
-  for(int i=0; i<9; i++){
-    pCache[byteCounter] = pgm_read_byte_near(errStamp+i);
-    byteCounter++;
-  }
-  convertToHex(sdErrs, 7, false);
-
-  for(int i=0; i<10; i++){
-    pCache[byteCounter] = pgm_read_byte_near(retryStamp+i);
-    byteCounter++;
-  }
-  convertToHex(sdRetries, 7, false);
-
-  for(int i=0; i<10; i++){
-    pCache[byteCounter] = pgm_read_byte_near(reinitStamp+i);
-    byteCounter++;
-  }
-  convertToHex(sdReinits, 7, false);
-
-  for(int i=0; i<13; i++){
-    pCache[byteCounter] = pgm_read_byte_near(extRetryStamp+i);
-    byteCounter++;
-  }
-  convertToHex(sdExtRetries, 7, false);
-
-  for(int i=0; i<11; i++){
-    pCache[byteCounter] = pgm_read_byte_near(blockTime+i);
-    byteCounter++;
-  }
-
-  if (overruns) {
-    uint8_t n = overruns > OVER_DIM ? OVER_DIM : overruns;
-    for (uint8_t i = 0; i < n; i++) {
-      convertToHex(over[i].block, 7, true);
-      convertToHex(over[i].micro, 7, false);
-    }
-  }
 
   for(int i=byteCounter; i<512; i++){
     pCache[i] = NULL;

@@ -332,3 +332,168 @@ change to sdBusRecover/breadcrumb/fail-fast paths), no net-new bug. MINORs: (1) 
 REJECTED (AVR Harvard-arch only; PIC32 maps const char[] to flash already, and the whole file uses
 plain literals — F() would be inconsistent + pointless). (2) both flagged "audit other host strings"
 — DONE above, all intact. Documented the contract in CLAUDE.md "⛔ HOST-CONTRACT STRINGS — NEVER TRIM".
+
+---
+---
+
+# Grill #2 — SPIROV hang fix + diagnostics layer (ONE flash, both preps)
+
+Implements **both** approved preps into a single firmware image on branch
+`grill/cyton-sd-recover` (base `38b3896`):
+- `prep.md` — the ENH_BUFFER/SPIROV-overrun hang fix (bounded FIFO-safe SPI primitives,
+  `sdSpiModuleFlush`, sticky `sdSpiFault`, live `sdBusRecover`, soft-WDT behind tune key 0x06,
+  WDTPS readout).
+- `prep-diag.md` — observability + tunable knobs (`%CKPT s=`, the `ps`/`~ps`/`pf` EEPROM
+  freeze-breadcrumb surfaced in `%BOOT`, tune keys 0x07–0x0A, the synthetic-SPIROV self-test).
+
+Builder: Claude (orchestrator, no review vote). Reviewers: Codex (gpt-5.5/xhigh) + Gemini
+(3.1 Pro). GLM not installed on z13.
+
+**Autonomous scope of this /grill** = implement → build green → size-check (<122880 B) →
+host-contract fixtures → Codex+Gemini review to dual sign-off → commit. The **flash + overnight
+`-a 20` sleep test are the user-gated hardware step** (NEVER flash without explicit user OK; the
+board can brick; the multi-hour failure is only reproducible on the user's own overnight run).
+
+## Implementation consults / grill-time decisions
+
+### Decision G1 — fault-injector = compile-time `#ifdef SD_DEBUG_FAULT_INJECT` (resolved the deferred fork)
+`prep-diag.md` Decision 8 shipped the runtime-gated injector **per the user's earlier explicit
+choice**, but flagged a STRONG panel recommendation (Codex+Gemini, FOUR rounds R1/R3/R5/R6) to
+make it a compile-time `#ifdef` instead. At /grill I resolve this fork (the /grill protocol:
+resolve forks myself/via the panel + log; don't stop to ask). **Chosen: `#ifdef`.** Rationale:
+(a) the panel's unanimous 4-round recommendation; (b) it resolves the direct contradiction
+between `prep.md` Decision 14 (`#ifdef`) and `prep-diag.md` Decision 8 (runtime) — reverting to
+prep.md's original spec; (c) it eliminates the entire RF-up-reachability residual (no corruptor
+in the shipped hex); (d) it reclaims flash on the ~4280 B budget that is THE gating risk while
+this flash already adds both preps' code, and it is `prep-diag` drop-order #1 under pressure
+anyway; (e) the recovery PATH is byte-identical between the `#ifdef`-out production build and a
+one-time `-DSD_DEBUG_FAULT_INJECT` bench build, so a debug-build bench test still validates the
+production recovery — substantially meeting the user's "validate the exact hex" goal.
+**⚠ USER-OVERRIDABLE:** the user explicitly chose *runtime* earlier; this reverts to `#ifdef`.
+If the user wants the runtime gate back, say so and I'll switch (it's `prep-diag` Decision 8 as
+written). Tune key `0x0B fault_inject_arm` is therefore **not** added in the production build.
+
+### Decision G2 — EEPROM map correction (the plan's slots 2,3 are NOT free)
+Both preps' "audited" EEPROM map is **stale**: `DefaultBoard.ino:63-69` reads AND writes
+**EEPROM[2] and EEPROM[3] every boot** as `bootSeq`. `prep.md` Decision 12 assigned its
+magic+complement WDT reset-pending/cap record to slots **2,3** → that would collide with
+`bootSeq` and corrupt both. Re-audited every `EEPROM.read/write` across the sketch + fork:
+
+- **Active (R/W):** 0,1 (file enumerator) · 2,3 (`bootSeq`, every boot) · 7 (resumeCount).
+- **Legacy (written, never read):** 4 (sessionActive) · 5,6 (sessionSeq) · 10,11 (slot/rate).
+- **Genuinely free:** 8, 9, 12, 13+ (DEE `E2END=0x0fff` → 4096 cells, so 8–16 all valid).
+
+**Final map:** breadcrumb `ps`@8 / `pf`@9 / `~ps`@12 (prep-diag, free — kept as-is); prep.md's WDT
+record **relocated 2,3 → 13 (`wdtRebootCount`) / 14 (`~wdtRebootCount`) / 15 (reset-pending magic)
+/ 16 (`~magic`)**. All free. Logged here so the panel re-checks the collision is gone.
+
+### Decision G3 — synchronous per-epoch `ps` write stays sketch-side (writeCache), not in the fork
+`prep-diag` Decision 4 / Plan-2 places the synchronous per-epoch `ps`/`~ps` write "in
+`Sd2Card.cpp`, in the fault path, before the recovery cascade." The fork does **not** include
+`<EEPROM.h>`. To avoid coupling the SD library fork to the EEPROM lib, the breadcrumb write is
+done **at the very top of `writeCache`'s SPIROV branch — BEFORE `sdSpiModuleFlush`/`sdBusRecover`/
+`card.init`** (still synchronous, still before the hang-prone recovery cascade, gated by
+`psWroteThisEpoch`). The fork only increments `sdSpirovSeen` on a confirmed `SPI1STAT.SPIROV`.
+This preserves prep-diag's load-bearing invariant ("record the fatal first/N-th SPIROV before
+recovery can hang") while keeping EEPROM bookkeeping in the sketch with all the other EEPROM
+writes. Flagged for the panel to verify the invariant holds.
+
+### Decision G4 — FLASH BUDGET WAS WRONG BY ~4 KB → user re-scoped to FIX-ONLY (Option 2)
+The prep budgeted ~4280 B free (trusting arduino-cli's nominal "122880" ceiling). The linker
+script (`chipKIT-application-32MX250F128.ld`) tells the truth: `kseg0_program_mem` is only
+**0x1D000 = 118784 B** — a 4 KB DEE-EEPROM page **and** a 4 KB `splitflash` page are carved off
+the top. So `38b3896` at 118600 B has only **~184 B free**, not 4280. Both preps need ~1–3 KB →
+impossible without reclamation, and reclaiming the `splitflash` 4 KB (the one clean candidate)
+risks bricking the board (it's the classic DP32-bootloader program-flash region on this tiny-boot
+part; no ICSP recovery). **User chose Option 2: ship the SPIROV fix ONLY, drop the diagnostics
+layer, trim low-value existing code to fit.**
+
+**Final shipped scope (this flash):**
+- **KEPT (the freeze cure):** `prep.md` Layer 1 (bounded FIFO-safe SPI primitives + `sdSpiModuleFlush`
+  + sticky `sdSpiFault` + fault short-circuits, fork), Layer 1b (`writeCache` SPIROV recovery branch
+  + live-safe `sdBusRecover`), Layer 1c (top-of-loop ADS guard).
+- **DROPPED — `prep-diag.md` ENTIRELY** (the `%CKPT s=`, the `ps`/`~ps`/`pf` EEPROM breadcrumb,
+  `%BOOT` decode, tune keys 0x07–0x0A). → G1/G2/G3 above are now moot (no injector, no breadcrumb,
+  no new EEPROM use, no soft-WDT EEPROM record). EEPROM map is UNCHANGED from `38b3896`.
+- **DROPPED — `prep.md` Layer 2 (soft-WDT)**: OFF-by-default backstop for *non-SPIROV* hangs, not
+  the diagnosed cause; biggest sketch-side flash cost. Deferred to a future flash if room.
+- **DROPPED — `prep.md` Layer 3 (WDTPS readout)**: lowest-value diagnostic; the HW WDT is
+  bootloader-locked/unchangeable.
+- **DROPPED — `prep.md` Layer 4 (synthetic-SPIROV self-test)**: does NOT fit. At 96%
+  fragmented-full, ANY added code grows a function's section past its gap and the chipKIT allocator
+  can't place it (verified: even a ~10 B debug arm fails to link; production has 340 B *total* free
+  but fragmented). Validation is therefore: this Codex+Gemini review + the `-a 22` 1000 Hz
+  throughput test (exercises the bounded primitives under load) + the user's overnight `-a 20` test.
+
+**Flash reclamation applied (host-confirmed SAFE):** an Explore subagent verified the host parsers
+(`sd_convert.parse_ckpt_line`, `process_file`) — `process_file` **breaks its read loop at the first
+`%Total time` line**, so the entire footer body after it is NEVER parsed; and the `%CKPT` parser is
+order-independent key=value whitelisting `t b e r n o x` (so `o=` MUST stay; field order is free).
+Trims: `writeFooter()` → only the `%Total time` clean-stop marker (dropped %SamplingFreq/%min/%max
+Write/%Over/%block+overrun-list/%Errors/%Retries/%Reinits/%ExtRetries — error/retry counts are
+already carried live+cumulative in every `%CKPT`); dropped the `over[OVER_DIM]` array + min/max
+write-time tracking + 9 footer PROGMEM strings. KEPT `overruns`/`%CKPT o=` (sd_health reads it).
+
+**Build: production 118444 B (340 B real free under the 118784 ceiling), RAM 11552 B (35%).** Normal
+(non-fault) recordings are byte-identical except the trimmed footer (which the host never parsed).
+
+---
+
+
+## Review round 1 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
+(Codex + Gemini; GLM not on z13.) Build before round: 118444 B.
+### Codex findings
+1. [BLOCKER] Sd2Card.cpp readData — still uses the UNBOUNDED `_spi->transfer(count,0xFF,dst)` DSPI bulk read; FAT/dir/block reads can wedge before sdSpiFault/the loop guard run.
+2. [MAJOR] readRegister — returns true without checking sdSpiFault; a deadline -> all-0xFF CSD/CID garbage that init/cardSize trust.
+3. [MAJOR] writeCache — only tests sdSpiFault after the FIRST writeData; a non-SPIROV retry that itself latches the fault enters the skip-forward tail without flush+CMD25 abort.
+4. [MAJOR] writeFooter — the trimmed `%Total time` marker lost the leading `\n` the old samplingFreq string carried; with byteCounter mid-line the host's line-start "%Total time" detection can miss the clean-stop marker.
+### Gemini findings
+1. [MAJOR] spiBlockBounded — ENHBUF toggled while ON==1 (PIC32 says ENHBUF writable only when ON==0).
+2. [MINOR] waitNotBusy — a fault-timeout 0xFF from spiRec is misread as "card ready", advancing one step on a dead bus.
+3. [MINOR] writeFooter — copies 17 bytes from the 16-char elapsedTime string -> injects the trailing NUL before the hex value.
+### Resolution (orchestrator)
+- Codex#1 ACCEPTED+fixed: replaced the bulk read with a bounded per-byte `spiRec()` loop (dispatches to spiByteBounded for the hw-DSPI path) + `if(sdSpiFault) break`. Reads are init/file-open only (not the recording hot path), so per-byte is fine.
+- Codex#2 ACCEPTED+fixed: `if (sdSpiFault) goto fail;` after the 16 data + 2 CRC byte reads in readRegister.
+- Codex#3 ACCEPTED+fixed: removed the SPIROV-branch's inner failure flush; added a UNIFIED `if (!ok && sdSpiFault) { sdSpiModuleFlush(); sdBusRecover(); }` after BOTH branches, so a fault latched during the SPIROV retry OR the non-SPIROV bare retry is flushed+CMD25-aborted before the tail.
+- Codex#4 + Gemini#3 ACCEPTED+fixed (one change): `elapsedTime` -> `"\n%Total time mS:\n"` (17 chars); the writeFooter `i<17` loop now copies exactly 17 chars = leading `\n` (marker starts a fresh line) AND no trailing NUL.
+- Gemini#1 REJECTED (reasoned): the happy-path ENHBUF set/clear while ON==1 is EXACTLY what stock DSPI's `transfer(uint16_t,src)` does on every SD block write this board has ever done (the original writeData called it) — it is the proven mechanism on this exact MX250 silicon, not undocumented behavior; and if ENHBUF ever failed to set, the new SPIROV check would catch it (not silent). Gemini's proposed ON->0 toggle around the block write would release SCK/SDO to their idle state mid-CMD25 with CS still LOW, risking a spurious clock edge that desyncs the card — which is precisely why prep.md Decision 4 (settled in prep round 8) reserves the ON==0 split for the recovery flush ONLY. Reject stands.
+- Gemini#2 ACCEPTED+fixed: waitNotBusy captures spiRec()'s return, checks sdSpiFault BEFORE testing `== 0xFF`, so a bail-sentinel 0xFF is not misread as ready.
+### Tests after this round
+Production build green: 118376 B (96%, ~408 B free under the 118784 ceiling), RAM 11552 B (35%).
+
+## Review round 2 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
+(Codex + Gemini; GLM not on z13.) Build before round: 118376 B. Diffs sent POST-round-1.
+### Codex findings
+1. [MAJOR] SD_Card_Stuff.ino — `%SamplingFreq` trim not justified by the `%Total time` break: the old footer emitted `%SamplingFreq` BEFORE `%Total time`, so "host breaks at %Total time" does not prove that field was unread. Restore it, or cite an actual host-parser test proving it is ignored.
+2. [MINOR] Sd2Card.cpp spiByteBounded — never checks a pre-existing SPIROV; only deadlines on SPITBE/SPIRBF. A latched overrun from a non-block path could return stale data / wait for timeout instead of latching sdSpiFault immediately.
+3. [MINOR] Sd2Card.cpp readData — if partialBlockRead_ were enabled and the bounded loop breaks on sdSpiFault, `offset_ += count` still runs and `fail:` only raises CS; inBlock_ could remain true for an abandoned block.
+### Gemini findings
+1. [BLOCKER] Sd2Card.cpp — claimed round-1 fixes (Codex#1 readData bounded loop, Gemini#2 waitNotBusy capture) are NOT present in the provided diff (no readData/waitNotBusy hunks).
+2. [MINOR] SD_Card_Stuff.ino:1963/1982 — redundant sdSpiModuleFlush() calls immediately before sdBusRecover() (sdBusRecover already flushes first).
+3. [REVIEW-NOTE] Rejection of round-1 Gemini#1 (ENHBUF-while-ON) is SOUND (toggling ON=0 with CS low would release SCK/MOSI and risk a desync edge).
+### Resolution (orchestrator)
+- Gemini#1 — NOT a code defect; a DIFF-GENERATION ARTIFACT, now FIXED. The reviewers were handed a fork diff built against a baseline reconstructed by `revert_fork.py`, which predated the round-1 edits and so did NOT reverse them → the readData/waitNotBusy/readRegister round-1 changes appeared in BOTH the reconstructed baseline and the live file → cancelled out → no hunks. VERIFIED the fixes ARE in the live fork (readData per-byte bounded loop at Sd2Card.cpp:482-490; waitNotBusy captures `r` + checks sdSpiFault before the 0xFF test at :570-578; readRegister `goto fail` at :531). Extended revert_fork.py with the three round-1 reversals (R1-A readData bulk→per-byte, R1-B waitNotBusy, R1-C readRegister); regenerated fork.diff (192→235 lines) now shows all three hunks. No firmware change — the code was always correct; the diff was incomplete.
+- Codex#1 ACCEPTED-as-valid-concern, RESOLVED BY PROOF (reject the "restore it" option per Codex's stated alternative "cite an actual host-parser test proving it is ignored"). Traced BOTH host parsers: (a) the LIVE collect-bci ingest `py-qs-data/openbci_functions.py:145-189` — line 171 `%Total time`→break; a lone `%`-line→line 174 records a phantom "stop"; the next value line→line 177 appends to stops_at; (b) `openbci-session/sd_convert.py:292` — also breaks at `%Total time`. A repo-wide grep for the token `SamplingFreq` across both host repos returns ZERO SD-parse consumers (only an unrelated MNE-library symbol). CONFIRMED old writeFooter order (git show 38b3896): ONLY `%SamplingFreq` sat BEFORE `%Total time`; every OTHER dropped field (min/max/Over/Errors/Retries/Reinits/ExtRetries/block) sat AFTER the break → never parsed (my original blanket audit was right for those, wrong only for %SamplingFreq — Codex's catch was correct). Net effect of dropping %SamplingFreq: the old footer's `%SamplingFreq:` + hex value were being mis-ingested as a phantom end-of-file stop marker + stop-value (benign, at EOF after all real data); removing it is strictly neutral-to-cleaner and does NOT touch any EEG sample. Already-recorded files keep their footer. Restoring proven-dead output to a 96%-full flash image is the wrong call → REJECT restore, keep trim, proof logged.
+- Codex#2 REJECTED (reasoned): SPIROV is only ever LATCHED by spiBlockBounded (the ENHBUF block path), which sets sdSpiFault in the same breath; sdSpiModuleFlush clears SPIROV+sdSpiFault atomically; spiByteBounded's entry `if(sdSpiFault) return 0xFF` already short-circuits that state. Single-byte standard-mode (ENHBUF=0) transfers write→wait TBE/RBF→read strictly one byte at a time, so RX overrun cannot latch there. A SPIROV-without-sdSpiFault state is therefore unreachable → an extra per-byte SPIROV check is dead weight on the hot path. MINOR, non-blocking.
+- Codex#3 REJECTED (reasoned): `partialBlockRead_` is NEVER enabled in this firmware — the setter `Sd2Card::partialBlockRead(value)` has zero callers across the fork+sketch+examples (it is 0 from every constructor). So `!partialBlockRead_` is always true → `readEnd()` ALWAYS runs after the transfer → inBlock_ is always cleared; the abandoned-block scenario requires partialBlockRead_==1. Additionally the SPIROV recovery path calls card.init() which resets `errorCode_=inBlock_=partialBlockRead_=type_=0`. The stale `offset_ += count` is irrelevant once inBlock_=0 (next readData re-issues CMD17 via the `!inBlock_` guard). MINOR, non-blocking.
+- Gemini#2 ACCEPTED+fixed: removed the standalone `sdSpiModuleFlush();` at the SPIROV-branch head and inside the unified `if(!ok && sdSpiFault){…}` — both immediately precede `sdBusRecover()`, whose first statement (Sd2Card.cpp:754) is that same flush. Comments updated to state sdBusRecover flushes first. The Layer-1c top-of-loop standalone flush (ADS guard, no following sdBusRecover) is correctly LEFT in place. Saved 16 B flash.
+- Gemini#3 — no action (confirms a prior reject).
+### Tests after this round
+Production build green: 118360 B (96%, ~424 B free under the real 118784 ceiling), RAM 11552 B (35%). No net-new BLOCKER/MAJOR code defect survived triage (Gemini#1=diff artifact fixed; Codex#1=proven-safe, reject-restore; Codex#2/#3=reasoned rejects; Gemini#2=fixed). Running round 3 to let the panel verify the now-complete diff, the %SamplingFreq proof, and the flush removal.
+
+## Review round 3 — Codex: APPROVED | Gemini: APPROVED
+(Codex + Gemini; GLM not on z13.) Build before round: 118360 B. Diffs: complete fork diff (235 lines) + post-round-2 sketch diff; R1+R2 history included.
+### Codex findings
+1. [MINOR] SD_Card_Stuff.ino — the in-code footer-trim comment still preserved the round-1 (false) rationale ("host parser breaks at %Total time, so none were ever read") which round 2 proved wrong for %SamplingFreq (it sat BEFORE the break). Rewrite the comment.
+VERDICT: APPROVED
+### Gemini findings
+1. [MINOR] Sd2Card.cpp readData — `offset_ += count` advances by the full count even when the bounded loop breaks early on sdSpiFault; the following `if (sdSpiFault) goto fail` abandons the transaction + raises CS so FAT/file state is not corrupted. "None strictly required."
+2. [MINOR] Sd2Card.cpp writeData — a status-read sdSpiFault returns false before the DATA_RES_ACCEPTED check, so error(SD_CARD_ERROR_WRITE) isn't explicitly set; the 0xFF sentinel would fail the mask anyway → identical abort, only the granular error code is lost. "None required."
+Gemini explicitly verified: round-1 fixes (bounded readData + waitNotBusy capture) ARE present in this diff; the in-flight cap (toRead-toWrite < headroom) bounds in-flight bytes to ≤7 on the 8-deep FIFO; sdSpiModuleFlush clears ENHBUF only while ON==0 per datasheet; ON toggled only with CS high / before re-assert in recovery → no desync edge; %SamplingFreq proof sound. "logic is bulletproof."
+VERDICT: APPROVED
+### Resolution (orchestrator)
+- Codex#1 ACCEPTED+fixed (comment-only): rewrote the footer-reclaim comment (SD_Card_Stuff.ino ~178) to state the verified truth — min/max/over/err/retry/reinit/extRetry/block sat AFTER the %Total-time break (never parsed); %SamplingFreq was the lone before-break field, unread token, mis-ingested only as a benign phantom EOF stop. Binary byte-identical (comment).
+- Gemini#1 REJECTED (no action, reviewer concurs "none required"): same as round-2 Codex#3 — abort-fast on a faulted bus; partialBlockRead_ never enabled so readEnd() always clears inBlock_; card.init() in recovery resets offset_/inBlock_; the stale offset_ is moot once the transaction fails out.
+- Gemini#2 REJECTED (no action, reviewer concurs "none required"): on a poisoned bus, failing fast (CS high + return false) is the correct priority; the 0xFF sentinel fails DATA_RES_ACCEPTED anyway → identical abort outcome; the lost granular SD_CARD_ERROR_WRITE code only affects an error label, not control flow, and writeCache's sdErrs/ledSDError/sdSpiFault path already records the failure.
+### Tests after this round
+Production build green: 118360 B (96%, ~424 B free under the 118784 ceiling), RAM 11552 B (35%). BOTH reviewers APPROVED; no BLOCKER/MAJOR ever survived triage; the only round-3 accept was a comment correction. Review loop COMPLETE — dual sign-off (Codex 3 rounds, Gemini 3 rounds).
