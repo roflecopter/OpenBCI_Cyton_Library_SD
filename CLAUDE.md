@@ -207,3 +207,45 @@ is only reproducible on a real overnight run). Flash with the normal `pic32prog`
 Stray `F`/`j`/`s`/`1` ignored mid-stream (`B` held); auto-resume after power-cycle (×3, clean);
 `session_start.py --stop` round-trip; 45-min endurance run cleared block 101,340 with `B=2432000`
 and **zero SD errors** (`%CKPT e=0 r=0 n=0`); 1000 Hz × 8-ch sustained (write 326–332 µs, 0 overruns).
+
+## Mid-recording HANG re-diagnosis + universal SPI bounding (Stage A, 2026-06-30) — built + Codex+Gemini APPROVED, NOT yet flashed
+Branch `grill/cyton-hang-recovery` (off `grill/cyton-sd-recover` HEAD `3e93cde`). **The SPIROV fix
+(`3e93cde`) was flashed 2026-06-29 and STILL FROZE at ~7.1h** (slot OBCI_61, mid-block halt, **e=0 r=0
+across all 425 %CKPT** — identical signature to the pre-fix OBCI_5A). Proof the SPIROV diagnosis was the
+WRONG bug: the bounded writeData's recovery increments e/r and they stayed 0, and bounding the SD write
+changed nothing. **Re-diagnosis = an unobserved mid-recording MCU HANG; prime suspect = the ADS1299
+per-sample read, which went through the chipKIT `DSPI::transfer()` whose internals are UNBOUNDED**
+(`while(!SPITBE)/while(!SPIRBF)`, no timeout). Forensics: `obci_61_freeze_forensics.md`. Full plan:
+`prep.md` (8-round dual-signed-off) + `prep-review-log.md`.
+
+**Stage A (this build) — what changed:**
+- **Universal ADS+accel SPI bounding** (`OpenBCI_32bit_Library.cpp`, archived `patches/ads-accel-spi-bounding.cpp`):
+  `xfer()` (the chokepoint for ALL ADS reads/writes/commands) + the 3 LIS3DH accel helpers now route
+  through the OBCI32_SD fork's bounded `spiByteBounded` instead of the unbounded `DSPI::transfer()`. On a
+  CP0-deadline stall it latches the shared sticky `sdSpiFault` + returns 0xFF; the EXISTING top-of-loop
+  `if (sdSpiFault) sdSpiModuleFlush()` guard recovers the bus next iteration → a faulted sample reads 0xFF
+  (one garbage sample per rare wedge) instead of a frozen board. **If the freeze IS the ADS DSPI unbounded
+  wait (the diagnosis), this fix alone makes it recover.** Safe because `spiByteBounded`'s entry
+  short-circuit (returns 0xFF without touching SPI1STAT when `sdSpiFault` is set) means an ENHBUF-set bus
+  is never mis-read. **NET FLASH −212 B** (dedup — shared free function replaces 8 inlined DSPI calls).
+- **DEVCFG1 readout in every %BOOT** (`SD_Card_Stuff.ino`): ` wd=0x<DEVCFG1>` (raw 32-bit @0xBFC00BF8).
+  The hardware-WDT (Phase 1) has a HARD pre-flash gate on FWDTEN (bit 23, must be 0) + WDTPS (bits 20:16)
+  which **can't be read with the board offline** — so surface it in %BOOT; the next flash's card reveals
+  WDTPS and makes the Stage-B WDT decision data-driven. Decode formula is in-code beside the readout.
+  Parser-safe (host ignores unknown trailing %BOOT tokens).
+- **Build 118452 B (96%, 332 B free under the REAL 118784 ceiling), RAM 11552 B.** Codex+Gemini both
+  APPROVED at review round 2 (`grill-review-log.md`); both ENDORSED the staging. Round-1 BLOCKER fixed: a
+  latent unspecified-eval-order byte-swap in `LIS3DH_read16` (sequenced into locals).
+
+**DEFERRED to Stage B (NOT a value-judgment skip — a hard data dependency):** the hardware WDT (Phase 1) +
+the persistent breadcrumb. The WDT's pre-flash gate (WDTPS) is unreadable until Stage A's `%BOOT` reveals
+it, AND the persistent-RAM breadcrumb is INERT without the WDT (a Stage-A freeze hangs until a manual cold
+power-cycle = RAM drained = nothing captured; the breadcrumb only records across a WARM reset, which only
+the WDT produces). Stage B is unblocked once the user flashes Stage A and reports: (a) the `wd=0x` value,
+and (b) whether the next overnight slot is CLEAN (Phase 0 fixed it → WDT may be unnecessary) or truncates
+again (the hang is NOT the ADS path → WDT+breadcrumb needed to locate it).
+
+**⚠ NOT flashed** — board was offline this session; final verification is the USER's flash + overnight
+`-a 16` sleep soak (the multi-hour freeze only reproduces on a real overnight run). Flash with the normal
+`pic32prog` invocation (**NEVER a kill-timeout** — that bricked Cyton A; let it run to "Verify flash … done").
+Artifact: `build-grill/DefaultBoard.ino.hex`.

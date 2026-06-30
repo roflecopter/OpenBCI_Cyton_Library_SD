@@ -1545,6 +1545,27 @@ boolean setupSDcard(char limit){
       uint16_t gapMs = (uint16_t)(millis() & 0xFFFF);  // boot -> slot-create latency (the gap floor)
       EMIT_HEX16(gapMs);
     }
+    // DEVCFG1 readout — UNCONDITIONAL (every %BOOT, fresh or resume). prep.md Phase 1 gate / Stage A
+    // observability: the hardware-WDT (Phase 1 / Stage B) has a HARD pre-flash gate on FWDTEN (DEVCFG1
+    // bit 23, must be 0) + WDTPS (bits 20:16, the timeout) — and DEVCFG1 @0xBFC00BF8 CANNOT be read with
+    // the board offline. So surface the raw 32-bit value in EVERY %BOOT: the next flash's card then
+    // reveals the actual WDTPS and the WDT decision becomes data-driven instead of inferred. Host parsers
+    // ignore unknown trailing %BOOT tokens (Decision 8), so `wd=` is parser-safe; it does add a field to a
+    // fresh %BOOT (an intentional observability change, no longer byte-identical). Raw hex, not decoded in
+    // firmware (decode by eye off the card) to spend zero extra flash.
+    // DECODE (PIC32MX DEVCFG1, the emitted 32-bit word wd=0xHHHHHHHH): FWDTEN = bit 23 (mask 0x00800000;
+    //   0 = WDT OFF at reset = SAFE to software-arm in Stage B, 1 = WDT already on = do NOT ship the WDT);
+    //   WDTPS = bits 20:16 (mask 0x001F0000 >> 16) = postscale, timeout ≈ (2^WDTPS) ms (PS value N → ~2^N ms,
+    //   e.g. 0x0A→~1.0s, 0x0D→~8.2s, 0x14→~1048s); WINDIS = bit 22 (0x00400000); FWDTWINSZ = bits 25:24.
+    //   The WDT (Phase 1 / Stage B) ships ONLY if FWDTEN==0 AND the WDTPS timeout clears the worst
+    //   pet-to-pet gap with margin (prep.md Decision 6/7). See also grill-review-log.md.
+    {
+      uint32_t devcfg1 = *(volatile uint32_t *)0xBFC00BF8;
+      static const char prefixW[] = " wd=0x";   // 6 chars
+      EMIT_LIT(prefixW, 6);
+      EMIT_HEX16((uint16_t)(devcfg1 >> 16));
+      EMIT_HEX16((uint16_t)(devcfg1 & 0xFFFF));
+    }
     EMIT_BYTE('\n');
 
     #undef EMIT_HEX16

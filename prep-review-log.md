@@ -1,320 +1,217 @@
-# Prep review log — Cyton freeSD MCU-hang fix (SPIROV-bounded SPI primitive)
+# prep-review-log — Cyton freeSD mid-recording HANG fix (WDT + bounded ADS-read + breadcrumb)
 
-Adversarial planning review of `prep.md` by **Codex (gpt-5.5)** + **Gemini (3.1 Pro)**.
-Claude authors/orchestrates; casts no vote. Backstop raised (user: "deeply, increase
-rounds") — iterate while rounds surface net-new BLOCKER/MAJOR holes.
-
-(Prior task's log archived as prep-review-log-busrecover-2026-06-28.md.)
-
----
+Plan: `prep.md` (this repo). Re-diagnosis evidence: `obci_61_freeze_forensics.md`.
+Reviewers: Codex (gpt-5.5/xhigh) + Gemini (3.1 Pro). GLM not on z13.
+Builder/orchestrator: Claude (no review vote). Backstop: 7 rounds, adaptive early-stop.
 
 ## Round 1 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
-(GLM joins from round 2 — glm-review wrapper confirmed present.)
-
 ### Codex findings
-1. [BLOCKER] SD-fork-only bounding leaves the ADS path able to hang (shared SPI1; if SPIROV hit during an ADS read, writeCache recovery never runs).
-2. [BLOCKER] sdBusRecover still contains the unbounded primitive — a one-time SPIROV clear before board.spi.transfer doesn't bound the loop.
-3. [BLOCKER] ENHBUF/FIFO state not handled — raw SPI1BUF + SPITBE/SPIRBF poll only valid in standard 8-bit mode with RX drained.
-4. [BLOCKER] Clearing SPIROV before every byte can MASK corruption (a lost byte) → continue a corrupted transaction. Treat SPIROV as fatal-for-command, abort, drain+clear only in recovery, retry at a boundary.
-5. [BLOCKER] Mid-block/CMD25 stuck → card state ambiguous; "continue same slot" unproven. Fail closed / mark slot suspect unless cache+CMD25-stop+verify audited.
-6. [MAJOR] Not all SD transfer paths covered (init, CSD/CID, FAT/cache reads, metadata, spiRec(buf,n)). Wrap every hardware _spi->transfer in the fork.
-7. [MAJOR] Stuck handling after spiSend underspecified — check sdSpiStuck immediately after every send, deselect, single failure path.
-8. [MAJOR] "Tens of ms" loop-count caps non-deterministic + too large → drop many ADS samples. Use a core-timer/µs deadline + sample-loss counters.
-9. [MAJOR] Soft-WDT reset safety asserted not enforced — loop-end + SDfileOpen ≠ clean cache/idle card. Require CS-high + card idle + cache clean, or clean-close first.
-10. [MAJOR] Soft-WDT persistence/cap lifecycle incomplete — define cap reset point; ensure tune default 0 can't be overridden by stale EEPROM/host replay.
-11. [MAJOR] WDTPS= boot print may break host contract until tested.
-12. [MAJOR] Synthetic hang doesn't prove the SPIROV fix; sketch-only macro won't reach the library; inject in the SD lib + log SPI1STAT/CON.
-13. [MAJOR] Recovery can silently lose EEG samples — add DRDY-gap/sample-loss accounting to footer; large gaps = failure not clean recovery.
-
+1. [BLOCKER] Reverting bounded SD SPI makes the WDT reset mid-CMD25 with ambiguous FAT state (≠ returning an error).
+2. [BLOCKER] DEVCFG1/WDTPS not a soft risk: if FWDTEN=1 the kill-switch is dead; if WDTPS short a healthy night resets. Gate flashing on verified FWDTEN=0 + measured timeout.
+3. [BLOCKER] Slot setup/rollover (card.init/createContiguous/erase/writeStart) legitimately exceed a short timeout; top-of-loop pet doesn't cover code already inside them.
+4. [BLOCKER] FAT root walks (chainSize/openRoot) are unpetted long loops reachable during replay/setup/slot ops.
+5. [BLOCKER] allocContiguous cluster-linking is another unpetted long loop.
+6. [MAJOR] ADS timeout needs a hard sample-valid contract — don't cache/write/send a torn/stale sample; reset ADS CS/SPI on fail.
+7. [MAJOR] Bounding only the ADS sample path leaves other live raw-DSPI callsites able to hang; centralize ALL through one bounded primitive.
+8. [MAJOR] Pet semantics underspecified: petting inside a blind wait hides a real hang; not petting inside known-progress FAT loops false-resets. Pet only on proven progress.
+9. [MAJOR] EEPROM breadcrumb atomicity/wear/map incomplete; DEE writes tear; clear "active" only after durable footer.
+10. [MAJOR] RAM no-init not a reliable discriminator (SRAM may survive brownout; stale magic mislabels a power-cycle). Treat as advisory; require EEPROM/session evidence.
+11. [MAJOR] Don't drop the wdt kill-switch for budget — it's part of false-fire mitigation, non-negotiable.
+12. [MAJOR] Plan overfit to ADS-read; safer: keep SD bounded, bound ADS, breadcrumb, compile WDT but prove WDTPS+pet coverage.
 ### Gemini findings
-1. [BLOCKER] Throughput regression + misdiagnosis: real trigger is the ENH_BUFFER bulk transfer overrunning the 8-byte RX FIFO when CPU delayed; per-byte loop disables the FIFO → drops ADS samples. Write a correct BOUNDED ENH_BUFFER block transfer locally instead.
-2. [BLOCKER] SPIROV clear leaves stale FIFO bytes → SPIRBF still set → bounded spin instantly succeeds reading a stale byte → off-by-one shift for all subsequent SD responses. Must DRAIN RX FIFO (read until SPIRBE=1) whenever SPIROV cleared.
-3. [BLOCKER] Soft-WDT loop-end "safe point" corrupts FAT: card is mid-CMD25 (CS high but awaiting data/CMD12); MCU reset + CMD0 discards the open write. Must writeStop()/closeSDfile() before executeSoftReset.
-4. [MAJOR] Per-night EEPROM cap never resets → accumulates across nights → permanently disables soft-WDT. Reset in setupSDcard() on a fresh (non-replay) session.
-5. [MAJOR] Missing SPITBE wait in bounded primitive is NOT optional — writing SPI1BUF while full corrupts the outgoing byte.
-6. [MINOR] WDTPS boot print is SAFE — session_start.py hard-drains + reset_input_buffer before its '?' probe.
+1. [BLOCKER] Reverting restores raw unbounded DSPI in the SD path → can't pet inside the system lib → a short WDTPS false-fires on legit FAT alloc / slot rollover. DON'T revert; SHARE the bounded primitive across ADS+SD (reclaims flash via reuse, lets a SPI hang fault).
+2. [BLOCKER] If FWDTEN=1 the one-flash deploy bricks (infinite reset in setup/handshake/idle, unpetted). Can't discover DEVCFG1 in the same flash; defensively pet everywhere.
+3. [MAJOR] chipKIT precompiled crt0 likely zeroes all .bss → RAM no-init breadcrumb destroyed on recovery. Use a known-safe absolute address (or — Claude: __attribute__((persistent))).
+4. [MAJOR] EEPROM DEE page-pack erase stalls CPU ~20 ms → drops ~20 EEG samples at 1000 Hz on the 60 s flush. Only write EEPROM on clean transitions / synchronously on fault, never periodically.
+5. [MINOR] Reverting then re-implementing the bounded technique for ADS is wasteful — share one primitive.
+### Resolution (Claude)
+- Codex#1 / Gemini#1 / Gemini#5 ACCEPTED (overrides the user's "revert" answer, tagged ASSUMPTION in prep.md Decision 2): do NOT revert; SHARE one bounded `spiByteBounded` across ADS-read AND SD-write. Dedup reclaims the flash the revert was for; no unbounded SPI remains; a wedged bus faults in software.
+- Codex#2 / Gemini#2 RESOLVED: added the FWDTEN=0 PROOF-BY-INFERENCE (current firmware never pets the WDT yet records 7 h → WDT must be off at reset → FWDTEN=0 → no brick) + a HARD pre-flash DEVCFG1 verify gate in /grill (Decision 7); if it ever shows FWDTEN=1/unusable WDTPS, ship without the WDT.
+- Codex#3/#4/#5 ACCEPTED (Decision 6): WDT armed ONLY in the steady sample+write loop; DISARMED around every long FAT/SD op (card.init/createContiguous/allocContiguous/chainSize/openRoot/erase/writeStart/rollover) + boot/handshake/idle/replay. Enumerate + gate each in /grill.
+- Codex#6 ACCEPTED (Decision 4): updateChannelData returns sampleValid; no torn/stale cache; reset ADS CS/SPI on fault.
+- Codex#7 ACCEPTED (Decision 3): inventory + route EVERY live `board.spi/_spi->transfer()` through the shared bounded primitive, not just the ADS sample read.
+- Codex#8 ACCEPTED (Decision 5): pet on PROVEN PROGRESS only; bounded primitives return ≪ WDTPS so need no internal pet; never pet inside a raw spin (none remain).
+- Codex#9 / Gemini#4 RESOLVED (Decision 8): DROP the EEPROM breadcrumb entirely → no DEE stall, no wear, no map conflict.
+- Codex#10 / Gemini#3 RESOLVED (Decision 8, using review_output.md#2): breadcrumb = `__attribute__((persistent))` RAM `{magic,phase,state}` (toolchain-supported, survives warm WDT reset); magic excludes cold-boot false positives; SD no-footer is the cross-check; treated advisory for the rare brownout-preserves-RAM edge.
+- Codex#11 ACCEPTED (Decision 10): the `wdt` kill-switch is non-negotiable; drop finer breadcrumb phases first.
+- Codex#12 PARTIALLY ACCEPTED: bounding the WHOLE SPI surface (#3) + the WDT for non-SPI hangs + the breadcrumb to confirm removes the ADS-overfit; the breadcrumb is explicitly there to TEST the hypothesis, not bet on it (Context + R4).
+- Added (review_output.md#1): boot-thrash via the EXISTING resumeCount cap (the WDT reset lands in it) + verify the clear-timing pitfall, switch to a 45 s-active clear if needed (Decision 9, R6).
+### prep.md changes this round
+Rewrote Goal/Context/Decisions/Plan/Files/Test/Risks: title → "universal SPI bounding + WDT + persistent breadcrumb"; no-revert + shared primitive; FWDTEN=0 proof + hard DEVCFG1 gate; WDT arm-only-steady / disarm-around-long-ops / pet-on-progress; sampleValid; drop EEPROM breadcrumb → persistent RAM; non-negotiable kill-switch; resumeCount-reuse boot-thrash.
+
+## Round 2 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
+### Codex findings
+1. [BLOCKER] Armed steady loop STILL has SD busy-waits (CMD25 multi-block card-busy, SD_Card_Stuff ~1253-1263); a short WDTPS can false-reset a healthy SD write. Fix: WDT off for every SD block/writeStop/sync OR prove all SD waits are hard-deadlined below WDTPS.
+2. [BLOCKER] "Disarm every long FAT/SD op" not auditable — writeReplayFail() 744-778, replay tail 1005-1008 also do FAT work; centralize WDT-off inside the SD wrappers.
+3. [BLOCKER] Rollover is an unprotected dead zone (card.init 1838/1899, CS-held 1790-1967) — a hang there is never recovered; make rollover a bounded state machine or preallocate the next slot.
+4. [MAJOR] Persistent magic is not a reset-cause discriminator; require magic+CRC + SESSION.TXT resume + prior-slot no-footer before labeling hung=.
+5. [MAJOR] Shared byte primitive != SPI ownership contract — a timeout must release the owning CS + restore mode; add owner-scoped transaction wrappers.
+6. [MAJOR] FWDTEN inference weaker than the gate — make the pre-flash tool hard-fail on a DEVCFG1 decode mismatch.
+7. [MAJOR] resumeCount clear-timing still deferred — change to ">=45s active streaming" NOW.
+### Gemini findings
+1. [BLOCKER] WDT disarm creates a permanent freeze window in FAT ops (circular cluster chain -> infinite FAT walk -> board frozen forever). DON'T disarm; pet inside the FAT loops; verify WDTPS>500ms.
+2. [BLOCKER] FWDTEN=0 inference ignores background ISR petting — a chipKIT-core CoreTimer ISR could implicitly pet the WDT, making it useless for main-loop hangs; must statically audit the core.
+3. [BLOCKER] Bounded SPI abort leaves hardware wedged — on a CP0 timeout SPI1 is left incomplete -> next call triggers SPIROV; MUST reset the SPI peripheral before returning.
+4. [MAJOR] SRAM retention mislabels battery pulls as hangs (capacitance retains SRAM seconds-minutes; fast battery-swap keeps magic valid) — require SD no-footer cross-validation or document false hangs.
+5. [MAJOR] resumeCount clears on %CKPT punishing short sessions — fix NOW (45s clear), don't defer.
 
 ### Resolution (Claude)
-ACCEPTED essentially all. Key redesign for round 2:
-- ENHBUF reality CONFIRMED by reading DSPI.cpp: single-byte transfer(uint32) = STANDARD mode (SPITBE/SPIRBF); the 512-byte writeData path uses transfer(512,src) which TEMPORARILY enables ENH_BUFFER and runs `while(toWrite||toRead)` with SPITBF/SPIRBE — its toRead-never-reaches-0-on-overflow IS the primary hang (Gemini#1 correct). → Replace with a LOCAL BOUNDED ENH_BUFFER bulk transfer (keep FIFO throughput) + a deterministic CP0-Count deadline; NOT a per-byte loop.
-- SPIROV = FATAL-FOR-COMMAND, never clear-and-continue (Codex#4, Gemini#2): on stuck → fail the SD command → recovery does writeStop(abort CMD25) + DRAIN RX FIFO (read SPI1BUF until SPIRBE) + clear SPIROV + card re-init/sdBusRecover at a clean block boundary + fresh writeStart → continue; if it can't clear → clean stop + REPLAYFL + footer (fail closed, Codex#5). No stale-byte off-by-one.
-- sdBusRecover uses the BOUNDED transfer + entry drain+clear, not a one-time clear (Codex#2).
-- ADS path (Codex#1): SPIROV's only source is the ENHBUF bulk SD write; the SD write runs sequentially AFTER the ADS read in loop() (DRDY ISR sets a flag only, does no SPI); recovery drains+clears SPIROV before returning so the next ADS read sees a clean bus; belt-and-braces drain at SD-write ENTRY. Will also propose a bounded guard on board.xfer and let round 2 judge necessity.
-- Deterministic CP0-Count (_CP0_GET_COUNT @ SYSCLK/2 = 20 MHz) deadlines, rollover-safe unsigned subtraction (Codex#8).
-- Soft-WDT (OFF default): on fire, attempt a BOUNDED clean-close (writeStop+footer+closeSDfile — now bounded via L1) THEN executeSoftReset→fresh-slot resume; if the close can't complete → sdCardDead clean-stop, never a blind reset (Gemini#3, Codex#9). Per-night EEPROM cap reset in setupSDcard on fresh (non-replay) session (Gemini#4). Provably inert when flag 0.
-- SPITBE wait mandatory (Gemini#5).
-- Synthetic test: fault-inject var lives in the FORK (extern set by the sketch token), forces a REAL SPIROV (under-drain once) to exercise true detect+drain+recover, behind SD_DEBUG_FAULT_INJECT in the fork (Codex#12).
-- Sample-loss/DRDY-gap accounting in footer + %E per recovered event (Codex#13).
-- Cover ALL fork _spi->transfer paths, not just writeData (Codex#6); check sdSpiStuck after every send/recv with one failure path + deselect (Codex#7).
-- WDTPS print: KEEP, confirmed host-safe at session_start.py:286 (reset_input_buffer before '?') — Gemini#6 right, Codex#11 over-cautious (SPLIT resolved with evidence).
+- **Codex#1/#2/#3 + Gemini#1 — KEY TENSION resolved by FLIPPING the WDT strategy.** Codex says "disarm around long ops"; Gemini says "DON'T disarm (disarm = a permanent freeze window for a circular FAT chain)". Both critiques of round-1's disarm-enumeration are correct: it is (a) not auditably enumerable (Codex#2), (b) a dead zone during rollover (Codex#3), and (c) a permanent freeze window in a corrupt-FAT infinite walk (Gemini#1). RESOLUTION (Decision 5/6, fully rewritten): **never disarm; pet EXACTLY ONCE at the top of loop(); never pet inside any sub-loop/waitNotBusy/FAT walk.** This makes the WDT contract "every loop() iteration completes within WDTPS" — any hang within one iteration (SPI re-spin, circular FAT walk, rollover wedge) prevents the next top-of-loop pet -> reset. No enumeration needed (kills Codex#2), no dead zone (kills Codex#3), and a circular FAT loop IS caught precisely because we DON'T pet inside it (kills Gemini#1). Codex#1's SD busy-wait is handled by the new constraint: WDTPS MUST exceed the worst legit single iteration; SD_WRITE_TIMEOUT=1500ms (verified in Sd2Card.cpp:32) is the dominant term, so /grill measures WDTPS+worst-iteration and lowers SD_WRITE_TIMEOUT and/or chunks rollover to fit (Decision 6).
+- **Gemini#2 (background ISR petting) — ACCEPTED + AUDITED THIS SESSION.** grep -riE 'WDTCON|ClearWDT|WDTCLR|watchdog' over the entire chipKIT pic32 core (cores/pic32/, incl. wiring.c + CoreTimer ISR) returns NOTHING -> no background petter. This both (a) keeps the FWDTEN=0 inference valid (nothing hidden explains 7h survival with WDT on) and (b) confirms the armed WDT can actually catch a main-loop hang. Folded into Context + Decision 7 + Plan step 3.
+- **Gemini#3 (bounded abort leaves SPI wedged) — ACCEPTED, new Decision 3b.** On a CP0 timeout the fault path MUST reset the SPI module (reuse the SPIROV fix's sdSpiModuleFlush: clear SPI1STAT overflow, drain SPI1BUF, toggle SPI1CON.ON) before returning, else the next access raises SPIROV and relocates the wedge. New risk R8.
+- **Codex#5 (owner CS not released) — ACCEPTED, folded into Decision 4.** Two-level cleanup: primitive resets the SPI module (3b); the CALLER releases its own CS + restores mode (ADS path raises ADS CS, SD path chipSelectHigh). The leaf byte helper can't own a CS, so the caller must.
+- **Codex#4 + Gemini#4 (breadcrumb mislabels battery-pull as hang) — ACCEPTED, Decision 8 downgraded to ADVISORY.** SRAM capacitance retains magic for seconds-minutes, so a fast battery pull-and-reconnect keeps magic valid. hung= is now emitted ONLY when corroborated: magic+CRC valid AND SESSION.TXT resume AND prior slot has NO %Total time footer (the authoritative unclean-end signal). Documented the battery-pull false-positive; for untouched soak tests a corroborated hung= is a real hang.
+- **Codex#7 + Gemini#5 (resumeCount clear) — ACCEPTED, fixed NOW not deferred.** Decision 9 now firmly specifies the clear moves from %CKPT to ">=45s of active streaming" (millis() delta), removing the short-session accumulation hole. Plan step 6 implements it (not "verify and maybe fix").
+- **Codex#6 (FWDTEN gate hard-fail) — ACCEPTED.** Plan step 3: /grill HARD-FAILS to Phases 0+2 (no WDT) unless DEVCFG1 decodes FWDTEN=0 AND WDTPS > worst-iteration+margin.
 
----
+### prep.md changes this round
+- Goal: WDT reframed as armed-continuously + top-of-loop pet (catches any in-iteration stall).
+- Context: FWDTEN paragraph hardened with the chipKIT-core no-background-petter audit (Gemini#2).
+- Decisions: 3b added (SPI module reset on timeout); 4 rewritten (owner-scoped CS cleanup + sampleValid); 5 fully rewritten (top-of-loop pet, never disarm); 6 fully rewritten (WDTPS>worst-iteration contract, lower SD_WRITE_TIMEOUT / chunk rollover); 8 rewritten (advisory + magic+CRC + no-footer corroboration); 9 rewritten (>=45s-active clear, fix NOW).
+- Plan: Phase 1 (steps 3-6) rewritten to arm-once + single top-of-loop pet + WDTPS gate + rollover state-machine fallback + now-not-deferred cap clear.
+- Files to touch + Test plan static checks + Risks (R2/R3 rewritten, R8 added) all updated to the flipped strategy.
 
-## Round 2 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED | GLM: CHANGES_REQUESTED
-(GLM joined. Dense, heavily-corroborated NET-NEW hardware-level blockers.)
-
-### Codex findings (16)
-1.[BLOCKER] writeStop() runs while SPI still poisoned. 2.[BLOCKER] mid-block CMD25 abort unproven (0xFD is payload mid-block). 3.[BLOCKER] "continue same slot" not integrity-safe (ambiguous LBA). 4.[BLOCKER] generic chipSelectHigh conflicts with CMD25-recovery ownership. 5.[BLOCKER] bounded bulk copy still permits the overrun (detect≠prevent). 6.[BLOCKER] drain/clear ordering incomplete (TX-idle, FIFO race). 7.[MAJOR] restore prev ENHBUF state not blind-off. 8.[MAJOR] clearing sdSpiStuck at every op entry erases a pending fatal fault. 9.[MAJOR] ADS guard "around" the call can't stop a hang INSIDE DSPI::transfer. 10.[MAJOR] card-busy timeout conflated with SPI hang. 11.[MAJOR] CP0 block budget under-specified/too optimistic. 12.[MAJOR] soft-WDT clean-stop claims stronger than mechanism (footer may also fail). 13.[MAJOR] EEPROM cap not a design. 14.[MAJOR] synthetic SPIROV may not force real overrun. 15.[MAJOR] scope too large for one flash → weak attribution + flash risk; stage it. 16.[MINOR] sample-loss must be in-band parser-visible.
-
-### Gemini findings (5)
-1.[BLOCKER] ENH_BUFFER/FIFO state corruption on mid-block bail; sdSpiDrainClear flips SPIRBE/SPIRBF semantics with ENHBUF off → drain loop instantly exits → RX wedged. FIX: disable+re-enable SPI module (ON=0;nop;ON=1) — atomic flush, fewer instructions. 2.[BLOCKER] missing-block/garbage on mid-block abort; skip leaves a 512B hole → parser crash; retry same sector or zero-pad. 3.[BLOCKER] SPIROV relatch race during manual drain (bytes arrive after drain, before clear) — module reset solves. 4.[BLOCKER] ADS-guard order backwards: ADS read precedes SD write in loop(); put the drain/reset at TOP of loop()/updateChannelData, not SD-write entry. 5.[MAJOR] soft/physical reset doesn't power-cycle the card → wedged CMD25 survives reboot; init must do CS-high+≥74 clocks+CMD0 to knock it out.
-
-### GLM findings (7)
-1.[BLOCKER] recovery skips the failed block → 512B hole in contiguous extent; retry the SAME block, don't advance blockCounter until written; else fail closed. 2.[BLOCKER] sdSpiDrainClear disables ENHBUF before draining (8→1 FIFO) → stale bytes inaccessible; drain WHILE ENHBUF on, then clear ENHBUF, then SPIROV. 3.[BLOCKER] block budget too tight → false-trip on legit card GC (tens of ms); the CP0 deadline is only to break an INFINITE spin, keep card-busy on SD_WRITE_TIMEOUT. 4.[MAJOR] TX FIFO not drained before CMD12 after mid-block abort. 5.[MAJOR] soft-WDT EEPROM cap reset defeated by the reset itself (setupSDcard sees "fresh") — use a sticky flag/RCON to skip cap reset on a soft-WDT reboot. 6.[MAJOR] soft-WDT clean-close lacks atomicity/fallback (writeStop ok but footer/close fail). 7.[MAJOR] flash budget unproven (~4280 B free) — need per-component size estimate.
-
-### Resolution (Claude) — architecture simplified by reading the EXISTING cascade
-DISCOVERY (writeCache 1906-2025 + sdBusRecover 745+): the existing recovery ALREADY does
-same-block retry — on card.writeData(pCache) fail it does writeStop()+writeStart(bgnBlock+
-blockCounter,…)+writeData(pCache) with the SAME buffered pCache, and only THEN skips forward
-(into a pre-ERASED ZERO block — card.erase() pre-zeros the extent at setup — NOT uninitialized
-garbage). sdBusRecover already does the SPI-mode CMD25 abort before card.init (the boot wedged-
-CMD25 knockout Gemini#5 asked for). So the SPIROV hang is INSIDE card.writeData, BEFORE this
-proven cascade runs. → The fix is SURGICAL: make the primitive RETURN (bounded), then PREPEND
-an SPI-module reset so the existing, battle-tested cascade runs on a clean bus. This shrinks the
-diff (addresses Codex#15/GLM#7 flash) and resolves the same-block BLOCKERs by leveraging existing
-logic the reviewers couldn't see.
-
-ACCEPTED → v3 design:
-- sdSpiBusReset() = SPI1CONCLR=ON; nop; SPI1CONSET=ON; re-assert MODE0 — atomic flush of TX/RX
-  FIFO + shift reg + SPIROV (replaces the broken sdSpiDrainClear; solves Codex#1/6, Gemini#1/2/3,
-  GLM#2/4, Codex#7/M, GLM#4). NO manual ENHBUF/drain.
-- writeCache: when card.writeData(pCache) returns false with sdSpiStuck set → sdSpiBusReset()
-  BEFORE the existing writeStop+writeStart(SAME block)+writeData retry. Same-block retry is the
-  existing first action (Codex#2/3, Gemini#2, GLM#1 — pCache preserved). Skip-forward only after,
-  into pre-erased zeros (accounted in sdRetries/footer).
-- spiBlockBounded FIFO-SAFE: in-flight cap (writes−reads ≤ headroom) so SPIROV never latches under
-  jitter (PREVENT, Codex#5); CP0 deadline = generous INFINITE-spin breaker (covers 512B shift +
-  ISR jitter, ~ms), SEPARATE from card-busy which stays on waitNotBusy/SD_WRITE_TIMEOUT — and a
-  mid-block-shift can't stall (host drives SPI clock; card-busy is BETWEEN blocks), so GLM#3/Codex#10
-  GC false-trip can't happen on the shift. sdSpiStuck set ONLY by CP0/SPIROV, never waitNotBusy.
-- Sticky fault: sdSpiStuck cleared ONLY by sdSpiBusReset in recovery, not at op entry (Codex#8).
-- ADS path: top-of-loop()/updateChannelData-entry bus guard (Gemini#4) + a real bounded ADS byte
-  primitive in OpenBCI_32bit_Library.cpp (Codex#9, SHOULD, flash permitting) — but recovery's
-  sdSpiBusReset runs synchronously before returning to loop, so the next ADS read already sees a
-  clean bus (primary protection); FIFO-safe prevention makes latching rare anyway.
-- sdBusRecover: add sdSpiBusReset + bounded primitives (Codex#2, Gemini#5 already partly present).
-- Soft-WDT (OFF default, key 0x06): clean-close (writeStop→closeSDfile, bounded) then reset; if
-  close fails → mark slot suspect + forensic REPLAYFL, never blind reset (Codex#12, GLM#6). Per-night
-  cap via a STICKY EEPROM "soft-wdt-reset-pending" flag (RCON unreliable — bootloader clears it),
-  set before reset, checked+cleared in setupSDcard so the reset doesn't reset the cap (GLM#5/Codex#13).
-- Synthetic injection: genuinely overflow (write ≥9 bytes w/o reading), test early/mid/late block,
-  log SPI1STAT/CON pre/post (Codex#14).
-- Sample-loss: existing sdErrs/sdRetries/%CKPT/%E already in-band; SPIROV events increment them +
-  an in-band %E discontinuity marker; verify parser tolerates (Codex#16/13).
-- Flash: surgical diff is small; self-test compiled OUT (no prod cost); KEEP one-flash bundle
-  (USER decision: minimize flash COUNT, not size; watchdog OFF → inert → no attribution loss vs
-  Codex#15). Per-component size estimate produced in /grill before flashing (GLM#7).
-SPLIT: none material — all three converged. Codex#15 "stage it" REJECTED on the user's explicit
-"everything in one flash" + the watchdog being inert when off (no overnight attribution loss).
-
----
-
-## Round 3 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED | GLM: (empty — transient "no review produced", re-run R4)
-
-### Codex findings (9)
-1.[BLOCKER] mid-block failure not a safe input to the cascade (bounded primitive can return written<512 / pre-CRC → writeStop consumed as payload). 2.[BLOCKER] sdSpiStuck lifetime inconsistent — primitive calls reset which clears the flag, so writeCache never sees the fault → treats it as ordinary SD failure. Split HW reset from fault consumption. 3.[BLOCKER] %E emission inside the failure path recurses into SD writing → mutates pCache/blockCounter before same-block retry; defer %E. 4.[MAJOR] SPI reinit underspecified (ON-toggle+nop+MODE0 doesn't restore BRG/MSTEN/SMP/CKE/CKP/MODE16-32/ENHBUF-off/prove SPIROV cleared). 5.[MAJOR] 0xFF timeout sentinel = SD ready → waitNotBusy reads it as not-busy; make status-bearing or check fault after every spiRec/spiSend. 6.[MAJOR] live recovery may bypass sdBusRecover (cascade only does bare card.init, which per its own comments can't abort CMD25). 7.[MAJOR] ADS guard calling fork symbols from OpenBCI_32bit_Library.cpp couples core lib to optional SD fork → breaks non-SD builds; keep register-local or in the sketch. 8.[MAJOR] soft-WDT EEPROM not brownout/power-cycle robust; old persisted tune could enable WDT during an attribution run; magic+complement, consume-once, don't auto-persist key 0x06. 9.[MINOR] specify -DSD_DEBUG_FAULT_INJECT via arduino-cli --build-property compiler.cpp.extra_flags + verify symbol.
-
-### Gemini findings (4)
-1.[BLOCKER] writeData failure sets CS high, defeating the cascade's writeStop (STOP_TRAN sent with CS high → ignored). 2.[BLOCKER] mid-block bailout leaves card expecting payload; 0xFD mid-payload is a DATA byte, not a stop → host/card desync; must clock the remaining payload+CRC (≈520) before stop. 3.[BLOCKER] writeCache recovery NEVER calls sdBusRecover (it's static, boot-only); live recovery only does card.init which can't knock a card out of mid-block CMD25. Call sdBusRecover (or the 520-flush) in the live cascade. 4.[BLOCKER] ENHBUF can only be written when ON=0 (PIC32 FRM); restoring ENH_BUFFER=0 while ON=1 fails → next standard spiRec hangs. Clear ENHBUF INSIDE the reset, between ON=0 and ON=1.
-
-### Resolution (Claude) — confirmed sdBusRecover (740-772) is the correct position-agnostic CMD25 abort
-sdBusRecover already does: CS-low → 520 dummy bytes (finishes ANY partial payload) → bounded BUSY
-wait → 0xFD STOP_TRAN → BUSY wait → CS-high+idle. It's static in SD_Card_Stuff.ino (callable from
-writeCache) but currently boot-only, and uses the UNBOUNDED board.spi.transfer. → v4:
-- sdSpiModuleFlush(): ON=0 → clear ENHBUF (legal only when ON=0, Gemini#4) → clear MODE16/32 →
-  clear SPIROV → ON=1, re-assert MODE0; does NOT clear the fault latch (Codex#2/4). Settle via
-  readback, not a bare nop.
-- sdSpiFault = STICKY latch set by the bounded primitives on bail; the primitive does NOT
-  flush/reset (recovery owns that); cleared ONLY by writeCache after it records+handles (Codex#2).
-- Callers (waitNotBusy etc.) check sdSpiFault after every spiRec/spiSend, not the 0xFF byte
-  (Codex#5).
-- writeCache recovery: if (sdSpiFault) → sdSpiModuleFlush() + sdBusRecover() (LIVE call — the
-  proper 520-flush+STOP_TRAN; Gemini#2/3, Codex#6, Codex#1) + card.init + writeStart(SAME block)+
-  writeData(pCache); DEFER %E out of the critical section (Codex#3); clear sdSpiFault. The
-  NON-SPIROV boundary failure keeps the existing bare cascade (byte-identical).
-- sdBusRecover: sdSpiModuleFlush at entry + route its pokes through a bounded byte so the 520-flush
-  can't itself hang.
-- ADS guard: a top-of-loop() SPIROV check in the SKETCH (DefaultBoard.ino, raw SFRs) — NO core-lib
-  edit, no fork coupling (Codex#7, also satisfies Gemini R2#4 read-side guard). Drop
-  OpenBCI_32bit_Library.cpp from files-to-touch.
-- Soft-WDT: key 0x06 NOT auto-written into the resume SESSION.TXT %TUNE line → defaults OFF every
-  session (Codex#8); sticky cap-reset flag = magic+complement, consume-once; audit EEPROM addrs.
-- Self-test: -DSD_DEBUG_FAULT_INJECT via --build-property compiler.cpp.extra_flags, verify symbol
-  in the .map (Codex#9).
-PRE-EXISTING (out of scope): Gemini#1 (writeStop runs with CS high in the boundary cascade) is a
-latent issue in the EXISTING boundary path; the SPIROV path uses sdBusRecover's own CS, so THIS
-bug is handled. Not touching the boundary path keeps non-SPIROV behaviour byte-identical; noted.
-
----
-
-## Round 4 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED | GLM: CHANGES_REQUESTED
-(Tight convergence — all three caught the SAME fault-clear-ordering bug. Refinements now.)
-
-### Codex (5)
-1.[BLOCKER] sticky sdSpiFault poisons its own recovery (still set while sdBusRecover/init/writeStart/writeData run → they all bail). 2.[BLOCKER] sdBusRecover must not honor the pre-existing latch (else 520-flush/STOP no-ops). 3.[MAJOR] sdSpiModuleFlush restore unsafe — saving CON mid-bulk captures ENHBUF=1; blind restore re-enables it. Restore a MASKED CON (force ON=0, ENHBUF=0, MODE16/32=0, keep mode bits, saved BRG). 4.[MAJOR] fault ownership incomplete outside writeCache (init/CSD/erase/writeStart/close/soft-WDT). 5.[MAJOR] top-of-loop ADS guard forces SD MODE0 before the ADS read → corrupts EEG unless ADS reprograms SPI every transfer.
-
-### Gemini (5)
-1.[BLOCKER] sdSpiFault cleared too late → every recovery step instantly aborts. FIX: clear it right after sdSpiModuleFlush, before sdBusRecover. 2.[BLOCKER] SPIROV recovery branch lacks failure handling → infinite silent block-drop loop (bypasses sdCardDead). Check writeStart/writeData returns; on fail → sdCardDead cascade. 3.[BLOCKER] soft-WDT defeats itself: aborting the reboot when clean-close fails leaves the board permanently dead — a watchdog MUST reboot. executeSoftReset even if close fails (mark slot suspect). 4.[MAJOR] sdBusRecover 520-loop on a wedged bus = 520×deadline ~5s stall. Add if(sdSpiFault) break in the loop. 5.[MAJOR] sdSpiModuleFlush forcing MODE0 breaks ADS1299 (needs MODE1). Restore SPI1CON exactly as saved, masking only ENHBUF+MODE16/32.
-
-### GLM (5)
-1.[BLOCKER] sdSpiFault latch deadlocks recovery primitives — clear immediately after sdSpiModuleFlush, before sdBusRecover. 2.[BLOCKER] sdSpiModuleFlush CON restoration ambiguity + ADS mode corruption via the top-of-loop guard; restore masked-saved CON; for the guard either verify ADS setMode-per-transfer, clear-SPIROV-only, or OMIT it (recovery runs synchronously). 3.[MAJOR] sdBusRecover bounded-byte cross-TU dependency — extern spiByteBounded from the fork or sketch-local. 4.[MAJOR] flash budget fallback missing — define PRODUCTION trim levers (debug prose is already out). 5.[MINOR] in-flight cap of 4 = only 1.6µs headroom; use 7 / eager-drain on SPIRBE.
-
-### Resolution (Claude) — convergent, mostly accepted; ADS guard dropped
-- **Fault-clear ordering (unanimous BLOCKER)**: reconcile R3#2 vs R4 cleanly — the PRIMITIVE only
-  LATCHES sdSpiFault (so writeCache SEES it) and does NOT flush; **sdSpiModuleFlush() CLEARS
-  sdSpiFault** (the "hardware handled" point). writeCache checks sdSpiFault → calls sdSpiModuleFlush
-  (clears flag+hw) → THEN sdBusRecover/init/writeStart/writeData run with a clean flag. A NEW fault
-  during recovery re-latches (Codex#1/2, Gemini#1, GLM#1).
-- **sdSpiModuleFlush restore (Codex#3, Gemini#5, GLM#2)**: save CON; ON=0; in the SAVED value clear
-  ENHBUF+MODE16/32 ONLY (preserve mode/CKE/CKP/MSTEN + saved BRG); clear SPIROV; write masked CON;
-  ON=1; readback. NEVER hardcode MODE0 (would break ADS MODE1).
-- **SPIROV branch fail-closed (Gemini#2)**: check writeStart()/writeData() returns; on failure →
-  join the existing sdCardDead/skip-forward/extended-window tail, never silent-exit.
-- **sdBusRecover (Gemini#4, GLM#3)**: sdSpiModuleFlush at entry (clears flag+hw); pokes via extern
-  spiByteBounded; `if (sdSpiFault) break;` in the 520-loop (and the BUSY waits) so a still-wedged
-  bus bails fast instead of 520×deadline.
-- **Soft-WDT always reboots (Gemini#3)**: on fire (opt-in only) → best-effort bounded clean close →
-  executeSoftReset(0) EVEN IF close fails (mark slot suspect via REPLAYFL), bounded by the per-night
-  cap. Safe because: 120s floor = only true freezes (board already hung, not actively writing); the
-  slot's dir entry is written at createContiguous so a reset leaves READABLE partial data (like
-  5D/5E), not all-NUL; boot sdBusRecover knocks the wedged card out of CMD25; per-night cap + 2.5s
-  resume-stabilize prevent a reset storm (the original all-NUL cause). Still OFF by default.
-- **DROP the top-of-loop ADS guard entirely (Codex#5, Gemini#5, GLM#2)**: SPIROV's ONLY source is
-  the ENH_BUFFER bulk SD write; recovery's sdSpiModuleFlush runs SYNCHRONOUSLY in the same loop
-  iteration's SD-write phase, BEFORE the next iteration's ADS read; standard-mode ADS reads can't
-  self-overflow. So the ADS path never sees a poisoned bus → no guard needed. Removes the ADS-mode
-  risk + saves flash. (No OpenBCI_32bit_Library.cpp edit; Layer 1c removed.)
-- **Fault ownership (Codex#4)**: every recovery/init ENTRY calls sdSpiModuleFlush (clears stale
-  flag+hw); fail-fast paths (setupSDcard) remain fail-closed (REPLAYFL). The latch only short-
-  circuits in-flight primitives of a wedged op; the next owner flushes.
-- **FIFO headroom (GLM#5)**: eager-drain every loop iteration on SPIRBE; write-gate at in-flight<7.
-- **Production trim levers (GLM#4)**: self-test already compiled out; if over budget, trim verbose
-  %BOOT/%CKPT/console strings, and (last resort) the soft-WDT suspect-marking elaboration — measured
-  per-component in /grill before flash.
-
----
-
-## Round 5 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED | GLM: CHANGES_REQUESTED
-(Converging — flow-ordering + 2 net-new holes from the round-4 guard removal.)
-
-### Codex (3)
-1.[BLOCKER] Plan Layer-1 bullets still say "does NOT touch sdSpiFault" + "restore MODE0" — stale vs corrected Decision 3. 2.[BLOCKER] masked CON `save & ~(ENHBUF|MODE16|MODE32)` keeps ON=1 → writes ENHBUF while ON=1 (violates the rule). Use `~(ON|ENHBUF|MODE16|MODE32)`, write while off, readback, set ON separately. 3.[MAJOR] SPIROV retry failure can fall into the tail with a NEWLY latched fault / active CMD25; normalize (flush+sdBusRecover or fail-closed) + document blockCounter/bgnBlock/pCache/CMD25 invariants at tail entry.
-
-### Gemini (4)
-1.[BLOCKER] Terminal SD failures poison the ADS bus — a SPIROV during cardCommand/writeBlock(FAT)/writeFooter bubbles to sdCardDead/soft-WDT which DON'T flush → next ADS read garbage. The mode hazard is gone (Decision 3 masked-CON), so RE-INTRODUCE `if (sdSpiFault){sdSpiModuleFlush();}` at top of loop (or flush in sdCardDead + soft-WDT). 2.[BLOCKER] soft-WDT clean-close is dead-on-arrival — a freeze likely already set sdSpiFault → the close short-circuits instantly. Call sdSpiModuleFlush() BEFORE the clean close. 3.[MAJOR] soft-WDT cap defeated by SESSION.TXT loss — not persisting 0x06 means a soft-WDT resume comes back WDT-OFF → can only fire once/night, cap moot, rest of night unprotected. Allow 0x06 in SESSION.TXT %TUNE (session-scoped, not global). 4.[MINOR] fall-through runs a 2nd doomed same-block retry; jump to skip-forward on live-recovery failure.
-
-### GLM (3)
-1.[MAJOR] sdCardDead/boundary tail leaves SPI poisoned for ADS (guard removed) — sdCardDead/terminal tail MUST sdSpiModuleFlush before returning. 2.[MINOR] Plan Layer 1.2 "restore MODE0" contradicts Decision 3 — align to masked-saved CON. 3.[MINOR] SPIROV recovery success path unspecified — add explicit `else { blockCounter++; return; }` so success doesn't fall through to the boundary cascade.
-
-### Resolution (Claude) — all accepted; guard re-introduced (now mode-safe)
-- Plan step 2 updated to match Decision 3 (clears sdSpiFault; masked-saved CON; no MODE0) — Codex#1/GLM#2.
-- Decision 3: `masked = save & ~(ON|ENHBUF|MODE16|MODE32)`; write masked (ON=0), clear SPIROV,
-  readback, then `SPI1CONSET=ON` separately (Codex#2).
-- RE-INTRODUCE Layer 1c: top-of-loop `if (sdSpiFault) sdSpiModuleFlush();` — keyed on the LATCH,
-  mode-safe via the masked-CON restore (this is WHY round-4's MODE0 version was unsafe and this is
-  not). Catches EVERY terminal/non-writeCache path (sdCardDead, soft-WDT, FAT writes) before the
-  next ADS read (Gemini#1, GLM#1). [Reverses the round-4 drop, now correct.]
-- Soft-WDT: sdSpiModuleFlush() FIRST (clears hw+latch) then the best-effort clean close then always
-  reset (Gemini#2).
-- Soft-WDT enable 0x06 IS carried in the session's SESSION.TXT %TUNE line (session-scoped → survives
-  a within-night resume; a fresh night's host-written SESSION.TXT omits it → default OFF → no leak to
-  an attribution night). Reconciles Gemini#3 with Codex R3#8. (Our overnight test runs with it OFF.)
-- SPIROV branch flow (Codex#3, Gemini#4, GLM#3): on success → `blockCounter++; byteCounter=0;` +
-  deferred %E + return (normal resume). On failure → `if(sdSpiFault) sdSpiModuleFlush();` then jump
-  DIRECTLY to skip-forward/extended-window/sdCardDead (bypass the redundant same-block retry). Document
-  the tail-entry invariants.
-
----
-
-## Round 6 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED | GLM: APPROVED
-(GLM approves. Remaining = narrow, precise refinements + doc consistency.)
-
-### Codex (1)
-1.[MAJOR] Stale bullets negate round-5 fixes: Files-to-touch still says "No top-of-loop SPIROV guard" + "tune key 0x06 (not persisted)"; Risks still says "re-assert SD MODE0". Align all to the corrected Decisions.
-
-### Gemini (3)
-1.[BLOCKER] PIC32 simultaneous ON/ENHBUF write hazard: `SPI1CON = masked` clearing ON+ENHBUF in one write may evaluate ENHBUF-writability on the OLD ON=1 → ENHBUF clear silently ignored. SPLIT: SPI1CONCLR=ON; readback; SPI1CONCLR=ENHBUF|MODE16|MODE32; clear SPIROV; SPI1CONSET=ON. 2.[BLOCKER] SPIROV retry failure leaves card wedged in CMD25: if the live retry's writeStart succeeded but writeData failed, the card is mid-CMD25; jumping to skip-forward whose writeStop sends one 0xFD (a data byte) → desync. Call sdSpiModuleFlush AND sdBusRecover before the skip-forward tail. 3.[MAJOR] Soft-WDT cap increment omitted — read/check/skip-reset described but never INCREMENT → fires endlessly → reset storm. Read+increment+writeback before the sticky flag + reset.
-
-### GLM (1) — APPROVED
-1.[MINOR] FIFO headroom inconsistent (Decision 4 "≤4" vs final "<7"). Align to in-flight<7 + eager-drain.
-
-### Resolution (Claude) — all accepted
-- Decision 3 → use ATOMIC bit ops, no masked-save (cleaner + resolves the hazard): `SPI1CONCLR=ON`
-  → readback → `SPI1CONCLR=(ENHBUF|MODE16|MODE32)` → `SPI1STATCLR=SPIROV` → `SPI1CONSET=ON`. Mode/
-  CKE/CKP/MSTEN/BRG are NEVER touched (so naturally preserved — no MODE re-assert anywhere). This
-  SUPERSEDES Codex R5#2's single-write (Gemini R6#1's split is the safe hardware-correct form).
-- Plan step 7 failure path → `sdSpiModuleFlush(); sdBusRecover();` (the 520-flush knocks the card
-  out of CMD25) BEFORE jumping to skip-forward (Gemini R6#2).
-- Soft-WDT (Decision 12 / Plan 11): read+increment+writeback the per-night cap byte immediately
-  before setting the sticky reset-pending flag + executeSoftReset (Gemini R6#3).
-- FIFO headroom → in-flight < 7 everywhere (GLM R6#1).
-- Fix the 3 stale bullets (Files-to-touch top-of-loop guard + 0x06 session-scoped; Risks drop "MODE0
-  re-assert") (Codex R6#1).
-
----
-
-## Round 7 — Codex: CHANGES_REQUESTED | Gemini: APPROVED | GLM: APPROVED
-(Two approvals. Codex raised one net-new MAJOR on the happy-path ENHBUF toggle; minors only otherwise.)
-
-### Codex (1)
-1.[MAJOR] spiBlockBounded happy-path ENHBUF toggle under-specified — on MX2xx ENHBUF set/clear also needs ON=0; the non-SPIROV path could leave ENHBUF wrong before spiSend/spiRec. Specify the same ON-clear/readback/ENHBUF/ON-set split for spiBlockBounded entry + successful exit, preserving mode/BRG.
-
-### Gemini — APPROVED (3 MINOR)
-1. name the EEPROM counter vs the limit distinctly. 2. force the register readbacks as volatile `(void)SPI1CON;`. 3. note the tail's redundant second STOP_TRAN after sdBusRecover is harmless.
-("mature, production-ready plan.")
-
-### GLM — APPROVED (1 MINOR)
-1. give the per-night cap byte magic+complement torn-write protection too (deferrable; off-by-default makes it non-material).
+## Round 3 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
+### Codex findings
+1. [BLOCKER] WDT is off in the recovery path it depends on — setup()->replaySessionFile()->card.init/openRoot runs before steady streaming; a WDT reset from a torn SD/FAT state can hang there unprotected. Bound/cover the recovery path or fail to idle.
+2. [BLOCKER] WDTPS gate insufficient for COMPOSED iterations — a real iteration combines slow block write + checkpoint/footer + error handling + rollover; don't "fix" a short WDTPS by lowering SD_WRITE_TIMEOUT into false SD failures.
+3. [BLOCKER] The 45s resumeCount clear defeats the thrash cap — a reset every 46+s clears the cap each time -> unbounded slot churn instead of stopping at 25. Track consecutive unclean resumes; clear only on a durable clean footer.
+4. [MAJOR] SPI reset-on-timeout doesn't reset external slave state — SD left in CMD25/busy or ADS mid-frame; WDT reset runs no owner cleanup. Add a boot/fault bus scrub (deassert all CS, reinit SPI, idle clocks, bounded SD abort/init, ADS SDATAC) before resume.
+5. [MAJOR] Owner-scoped CS cleanup incomplete — Phase 0 includes accel/live-register SPI; every slave needs an owner wrapper or one missed owner holds the bus wedged.
+6. [MAJOR] Breadcrumb internally inconsistent — Decision 8 requires CRC + corroboration but Phase 2 struct omits CRC and appends on magic alone. Implement magic+CRC, emit only after resume + prior no-footer, clear after durable footer.
+7. [MAJOR] CP0 deadline wrap safety unspecified — CP0 Count wraps ~215s at 20MHz, repeatedly overnight; the timeout primitive must use signed wrap-safe delta + be tested near-wrap.
+8. [MAJOR] Rollover state-machine fallback lacks a sample-data contract — splitting FAT work across iterations doesn't say where 500/1000Hz samples go; preallocate slots or define buffering/drop markers.
+### Gemini findings
+1. [BLOCKER] Lowering SD_WRITE_TIMEOUT corrupts physical SD writes (hardware busy up to 250-500ms+); waitNotBusy is already time-bounded -> pet the WDT INSIDE it instead of shrinking the timeout.
+2. [BLOCKER] Refusing to pet inside long legit FAT walks guarantees false resets (traversals take seconds on fragmented cards); rewriting SdFat into a state machine is unacceptable scope creep. Pet inside FAT walks but BOUND the walk (max-cluster cap) to defeat circular chains.
+3. [MAJOR] SPI module reset (3b) while a slave's CS is asserted clocks garbage (toggling SPI1CON.ON forces pins to PORT state -> spurious edges desync the slave). Return the fault FIRST, caller deasserts CS, THEN flush.
+4. [MAJOR] Clearing resumeCount after 45s incurs an EEPROM DEE stall mid-recording (violates "no EEPROM write in steady loop"). Defer the clear to a clean boundary or accept+document the drop.
+5. [MAJOR] wdt=0 kill-switch erased when a boot-loop clears SESSION.TXT -> defaults ON -> repeat failure. Persist the kill-switch in EEPROM independent of the session file.
+6. [MINOR] Sticky SPI fault clearing unspecified — if it stays sticky across iterations a single timeout fast-fails all future SPI forever. Clear it at top-of-loop / start of a new owner transaction.
 
 ### Resolution (Claude)
-- ACCEPT Codex#1: spiBlockBounded now enables/disables ENHBUF with the SAME ON=0 split discipline as
-  sdSpiModuleFlush (preserve mode/BRG); noted the stock-DSPI ENHBUF-toggle-while-ON empirically works
-  on this MX250 (bench-validation reference) but the split is spec-correct; brief ON=0 between blocks
-  (CS low, not mid-byte) doesn't disturb CMD25 — verify on bench.
-- Folded all MINORs into Risks (counter naming + magic+complement on the cap byte; volatile
-  `(void)SPI1CON` readbacks; double-STOP_TRAN-is-safe comment).
+- **THE FAT-PET QUESTION RESOLVED via a SYNTHESIS superseding both round-1 (disarm) and round-2 (never-pet-inside).** Gemini#1+#2 + Codex#2+#8 converged: do NOT lower SD_WRITE_TIMEOUT (tears legit card-busy writes) and do NOT chunk rollover into a state machine (scope creep + silent sample loss). NEW discipline (Decision 5/6 rewritten): **arm continuously; pet at top-of-loop AND inside the long-but-BOUNDED loops (waitNotBusy [already 1500ms-bounded], FAT walks); make every petted loop INDEPENDENTLY bounded** — add a max-cluster cap to chainSize/allocContiguous so a circular chain ABORTS (Gemini#2). A petted+independently-bounded loop can't run forever, so petting can't mask an infinite hang; the WDT still catches a genuinely unbounded un-petted spin. Then **WDTPS need only exceed the short pet-to-pet GAP, not the whole iteration** (resolves Codex#2) -> no SD_WRITE_TIMEOUT lowering needed for a short WDTPS.
+- **Codex#1 (WDT off in recovery path) — ACCEPTED, new Decision 10b.** Arm the WDT at the entry to the auto-resume path so card.init/FAT during replaySessionFile is covered; bounded by the thrash cap; cold fresh-start setup (no SESSION.TXT) stays uncovered (immediate user-visible failure, not a night-eraser).
+- **Codex#3 (45s clear defeats the cap) — ACCEPTED, Decision 9 REWRITTEN.** Replaced the 45s-active clear (defeated by a 46s-recurring hang) with: count consecutive resumes whose prior slot has NO %Total time footer, clear ONLY on a durable clean footer. Bounds the rapid thrash (hits 25 in ~20min), the multi-hour salvage (2-3 unclean chunks/night, never near 25), AND clears on a clean manual stop. This ALSO resolves Gemini#4 (the clear is now at the footer/stop boundary + the increment at resume -> neither in the steady loop -> no mid-recording DEE stall).
+- **Gemini#3 + Codex#5 (SPI flush ordering + all slaves) — ACCEPTED, Decision 3b/4 REWRITTEN.** Order: leaf primitive sets sticky fault + returns WITHOUT flushing; the OWNER wrapper deasserts its CS, THEN calls sdSpiModuleFlush on the idle bus, restores mode. EVERY slave (ADS/register/accel/SD) gets an owner wrapper. Sticky fault cleared at the start of the next owner transaction (Gemini#6).
+- **Codex#4 (external slave state) — ACCEPTED, new Decision 10c.** Full bus scrub on the resume path (deassert all CS, idle clocks, SD re-init, ADS SDATAC/reset) before re-using the bus, since a WDT reset runs no owner cleanup.
+- **Codex#7 (CP0 wrap) — ACCEPTED, folded into Decision 6 + Plan step 3 + Test (b).** Deadline math must be signed-wrap-safe ((int32_t)(now-deadline)>=0) across the ~215s CP0 wrap; /grill verifies the existing spiByteBounded + a forced near-wrap test.
+- **Gemini#5 (kill-switch erased) — ACCEPTED, Decision 10 REWRITTEN.** wdt kill-switch lives in the EEPROM tune store independent of SESSION.TXT, so a session-file wipe to recover the board doesn't re-enable the WDT. (The thrash cap independently self-terminates a boot-loop, so recovery never depends on the switch.)
+- **Codex#6 (breadcrumb inconsistency) — ACCEPTED.** Phase 2 struct now carries the crc field + corroborated-emit, matching Decision 8.
+- **Codex#8 (rollover sample contract) — RESOLVED by the synthesis.** No rollover state machine -> the concern dissolves; rollover stays atomic (pets inside its bounded sub-loops), sample handling during rollover is unchanged from current firmware (not made worse).
+- **Gemini#6 (sticky fault clear) — ACCEPTED.** Cleared at the start of each owner-scoped transaction (folded into 3b).
 
----
+### prep.md changes this round
+- Decisions 5 + 6 fully rewritten (pet-inside-bounded-loops synthesis; WDTPS>pet-to-pet-gap; CP0 wrap-safe; max-cluster FAT cap).
+- Decision 3b re-ordered (flush AFTER CS release); Decision 4 extended to all slaves + sticky-fault clear.
+- Decision 9 rewritten (consecutive-unclean footer-clear thrash cap, supersedes 45s); 10 rewritten (EEPROM kill-switch); 10b added (WDT covers resume path); 10c added (resume bus scrub).
+- Plan Phase 1 (3-6) rewritten; Phase 2 struct gains crc + corroborated emit; Phase 3 kill-switch -> EEPROM store.
+- Files-to-touch, Test plan static checks (a)/(b)/(d)/(h), Risks R2/R3/R6 all updated to the synthesis.
 
-## Round 8 — Codex: APPROVED | Gemini: CHANGES_REQUESTED | GLM: APPROVED
-(The v8 happy-path ENHBUF change — made for Codex R7#1 — introduced a regression Gemini caught.)
+## Round 4 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
+### Codex findings
+1. [BLOCKER] Resume WDT still arms AFTER SD discovery — confirming SESSION.TXT requires card.init/openRoot/FAT on the torn SD state; a hang there is before the WDT/scrub/counter. Arm before the first SD/FAT recovery access (minimal CS setup) + an EEPROM pre-session attempt cap.
+2. [MAJOR] Top-of-loop pet can mask a no-progress livelock — an unconditional pet doesn't prove recording progress; DRDY/sample/SD progress can stop while the loop spins and pets forever. Gate top-level pets on streaming progress, or stop after a CP0 no-progress deadline.
+3. [MAJOR] Petted-loop "bounds" depend on weak coverage — waitNotBusy is only bounded if its timeout source can't stall; a millis()/ISR bound + internal pets can mask interrupt-starvation. Also only waitNotBusy + chainSize/allocContiguous named, not all SD init/cmd/token/seek loops. Use CP0 signed-delta for every petted wait + inventory every SdFat loop under WDT.
+4. [MAJOR] Clean footer doesn't suppress a stale SESSION resume — a WDT reset after the footer but before SESSION.TXT cleanup leaves a clean slot + stale session; plan clears the cap but doesn't cancel replay. Footer-present must be authoritative: clear cap, ignore/delete SESSION.TXT, don't auto-resume.
+5. [MAJOR] Resume bus scrub isn't a real interrupted-CMD25 abort — idle clocks + card.init may not terminate a card mid multi-block awaiting a stop token/busy completion. Scrub must include bounded SD CS assert + CMD25 stop-tran token + clocks/wait-not-busy, then full reinit; fail idle if it can't.
+### Gemini findings
+1. [BLOCKER] Masked hang via stopped millis() in petted waitNotBusy — if the hang disables interrupts/halts CoreTimer, millis() stops, waitNotBusy spins forever AND keeps petting -> WDT masked, perfectly hiding the exact hang. The independent bound for any petted loop MUST use hardware CP0 Count or a strict iteration counter, not millis().
+2. [BLOCKER] Consecutive-unclean cap permanently locks out battery-pull users — clearing only on a clean footer means a user who chronically pulls the battery/SD accumulates unclean resumes across independent days -> after 25 normal uses, refuses to resume forever. Clear on a cold power-on reset (distinguishable via RCON or persistent-RAM magic invalid) so the 25-cap applies only to a contiguous rapid-fire boot-loop.
+3. [MAJOR] Unbounded/unpetted SPI bus scrub on resume — Phase 10c issues ADS SDATAC/reset before the WDT is armed or streaming begins; raw transfer()/blocking here -> permanent freeze (WDT not armed) or false-fire. Scrub must use the Phase-0 bounded primitive and be WDT-covered.
 
-### Gemini (3)
-1.[BLOCKER] Happy-path SPI pin-glitch: toggling ON=0 per block in spiBlockBounded releases SCK/SDO to PORT/TRIS while CS is low → spurious clock edge → desyncs the card. REVERT the happy-path to the empirically-safe ON=1 stock-DSPI approach; reserve the ON=0 split EXCLUSIVELY for sdSpiModuleFlush (recovery). 2.[MAJOR] soft-WDT clean-close defeated mid-CMD25: sdSpiModuleFlush then writeStop fails (bare 0xFD eaten as a data byte). Call sdBusRecover (520 clocks) after sdSpiModuleFlush before the close. 3.[MAJOR] spiByteBounded must entry-short-circuit on sdSpiFault, else a naive caller (FAT/close) stalls a full CP0 deadline per byte before bubbling up.
+### Resolution (Claude)
+- **CONVERGENT BLOCKER (Codex#3 + Gemini#1, found independently): millis()-bounded petted loops are masked by a stopped millis().** This is the sharpest finding of the review — the actual unknown hang could BE an interrupt-disable/CoreTimer-halt, in which case a millis()-bounded waitNotBusy spins forever while petting the WDT, masking the very hang we're catching. ACCEPTED -> Decision 5 REFORMULATED around **CP0-gated PROVEN-PROGRESS petting**: maintain lastProgressCP0 (bumped on real recording work — a sample cached / a 512B block written); gate the top-of-loop pet on a CP0 no-progress deadline (sized > worst rollover, fully under our control); convert waitNotBusy to a CP0 signed-delta bound; add a max-cluster ITERATION cap to the FAT walks; millis() gates NOTHING WDT-related. This single rule also resolves Codex#2 (no-progress livelock: loop spins, no samples -> no progress -> no pet -> reset).
+- **Codex#2 (top-of-loop pet masks livelock) — ACCEPTED, folded into the CP0-progress reformulation above** (the pet is gated on forward progress, not bare iteration).
+- **Codex#3 (coverage) — ACCEPTED.** Plan step 5: inventory EVERY blocking loop reachable under the armed WDT (all SdFat init/cmd/token/seek), each with a CP0 or iteration bound, not just waitNotBusy + the two FAT walks.
+- **Gemini#2 (battery-pull lockout) — ACCEPTED, Decision 9 REFINED.** The cap now counts only WARM-reset (magic-valid) consecutive no-footer resumes and clears on a clean footer OR a COLD boot (magic invalid). So the 25-cap bounds only a contiguous rapid-fire loop (SRAM-retained magic across fast resets); separate cold-start sessions always clear it -> no permanent lockout.
+- **Codex#1 (arm WDT before SD discovery) — ACCEPTED, Decision 10b SHARPENED.** Arm the WDT immediately after minimal CS setup, BEFORE the first SD/FAT access (reading SESSION.TXT itself touches the torn SD), + an EEPROM pre-session attempt counter bounding a card.init-stage hang loop.
+- **Codex#4 (stale SESSION resume) — ACCEPTED, new Decision 10d.** Resume decision = SESSION.TXT present AND last slot has NO clean footer; a present footer cancels replay + clears the cap + deletes stale SESSION.TXT (authoritative).
+- **Codex#5 + Gemini#3 (bus scrub not a real abort / unpetted) — ACCEPTED, Decision 10c REWRITTEN.** Scrub runs ONLY through the bounded primitive, AFTER the WDT is armed, with a real interrupted-CMD25 abort (stop-tran token + bounded waitNotBusy) before card.init + ADS SDATAC/reset, failing to clean idle if it can't complete.
 
-### Codex — APPROVED ("v8 closes the ENHBUF gap; no net-new hole").
-### GLM — APPROVED (noted the happy-path ENHBUF exit toggle as spec-correct/safe — DISAGREES with Gemini#1).
+### prep.md changes this round
+- Decisions 5 + 6 reformulated (CP0-gated proven-progress petting; software CP0 no-progress deadline; millis() banned from all WDT/petted-loop bounds; signed-wrap-safe CP0).
+- Decision 9 refined (warm-reset-only count + cold-boot clear, Gemini#2); 10b sharpened (arm before first SD access + EEPROM attempt cap); 10c rewritten (real bounded CMD25 abort, WDT-covered, bounded-primitive-only); 10d added (footer-authoritative resume cancellation).
+- Plan Phase 1 (3-6) rewritten; Test plan static (a)/(d); Risks R2/R6 updated to CP0-progress + cold-boot-clear.
 
-### Resolution (Claude) — Codex↔Gemini split resolved in Gemini's favor
-- **Gemini#1 (BLOCKER) ACCEPTED → REVERT v8's happy-path ON=0 split.** spiBlockBounded happy path now
-  matches the stock DSPI (ENHBUF set/clear while ON=1) — EMPIRICALLY proven on this MX250 and it never
-  toggles ON mid-transaction (no SCK glitch). The ON=0 split stays EXCLUSIVE to sdSpiModuleFlush, where
-  it's safe (the transaction is being abandoned + bus fully reset). This is a genuine Codex(wanted ON=0
-  split everywhere)↔Gemini(ON=0 mid-transaction glitches)↔GLM(ON=0 exit is safe) split: resolved for
-  Gemini because its mechanism is concrete (ON=0 → SCK to PORT/TRIS → spurious edge) AND the stock
-  ON=1 path is proven, so the hot path needs no new toggling at all. Codex R7#1's underlying worry
-  (ENHBUF-write-while-ON ineffective) is empirically false on THIS silicon (recordings work).
-- **Gemini#2 (MAJOR) ACCEPTED**: soft-WDT close = sdSpiModuleFlush → sdBusRecover → writeFooter/close →
-  always reset.
-- **Gemini#3 (MAJOR) ACCEPTED**: spiByteBounded (and spiBlockBounded) entry short-circuit
-  `if (sdSpiFault) return …;` — instant abort on a poisoned bus, no deadline stall.
+## Round 5 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
+### Codex findings
+1. [MAJOR] WDT lifetime conflicts with non-recording idle/fail-safe states — pets gated on recording progress, but clean idle/ledReplayFail/command-idle has no sample/block progress -> WDT reset loop. Scope "never disarm" to recovery/active recording; disarm or use a separate bounded idle policy before fail-safe/command idle.
+2. [MINOR] Serial-drain bound still says millis() in Phase 3 step 9 — make it iteration or CP0 only, matching Decision 11 + the static test contract.
+3. [MINOR] Files-to-touch omits the SdFat sources that own the FAT-loop fixes — chainSize/allocContiguous/seek/init loops live in SdVolume.cpp/SdFile.cpp, not SD_Card_Stuff.ino; add them so /grill doesn't under-patch.
+### Gemini findings
+1. [BLOCKER] "Proven progress" WDT gate causes infinite resets during setup, recovery, and idle — armed before first SD access + never disarmed + pet strictly gated on lastProgressCP0; during setup/scrub/card.init/idle-waiting-for-host no samples advance -> no-progress deadline expires -> pet skipped -> endless reset before recording begins. The CP0 no-progress gate must apply ONLY while isStreaming; during setup/recovery/idle the pet must be unconditional (or lastProgressCP0 kept fresh).
+2. [BLOCKER] EEPROM pre-session attempt cap permanently locks out SD init for casual users — increments every boot, clears only on a clean streaming start; a user powering on N times to check settings / stream without an SD card hits the cap, then card.init is aborted forever -> can never reach a clean streaming start to clear it -> permanent SD brick. The attempt cap must ALSO clear on a cold boot (magic invalid); a card.init WDT reset is a warm reset so cold-boot clear still bounds a contiguous card.init loop.
+3. [MINOR] FAT32 cluster iteration cap size — a 16-bit cap falsely aborts legit FAT walks on large cards (millions of clusters). Use uint32_t bounded against the volume's actual VolumeClusterCount, not a hardcoded small number.
 
----
+### Resolution (Claude)
+- **CONVERGENT BLOCKER (Codex#1 + Gemini#1, same issue + same fix): the CP0 no-progress pet gate false-resets during non-recording states.** This is the last architectural hole — a side effect of the round-4 CP0-progress reformulation. ACCEPTED -> new Decision 5b: the no-progress deadline applies ONLY while isStreaming==true; during setup/scrub/card.init/command-idle the WDT is fed by LOCAL liveness (each bounded long op pets on its CP0/iteration sub-progress; the command-idle host-wait loop pets per iteration — its correct behaviour IS to wait, so no livelock to catch, and a true freeze stops the poll loop -> reset). At TERMINAL clean idle (ledReplayFail / clean stop) the WDT is DISARMED (intentional halt, nothing to recover) — so "never disarm" is scoped to recording + active recovery (resolves Codex#1's fail-safe-idle reset-loop too).
+- **Gemini#2 (attempt cap locks out casual users) — ACCEPTED, Decision 10b.** The EEPROM pre-session attempt cap now ALSO clears on a cold boot (magic invalid), exactly like the resume-thrash cap (uniform cold-boot-clear for both warm-reset boot-loop caps). Bounds a contiguous card.init loop while allowing unlimited independent non-streaming/no-card sessions.
+- **Codex#2 (serial-drain millis) — ACCEPTED.** Plan step 9 changed to iteration/CP0, matching Decision 11 + the test contract.
+- **Codex#3 (SdFat files missing from touch list) — ACCEPTED.** Added OBCI32_SD utility/SdFile.cpp + SdVolume.cpp (where chainSize/allocContiguous/seek/init loops live) to Files-to-touch; /grill greps utility/ for every blocking loop reachable under the armed WDT.
+- **Gemini#3 (FAT cap width) — ACCEPTED.** The cluster-count cap is uint32_t bounded against the volume's actual cluster count, not a hardcoded 16-bit number.
 
-## Round 9 — Codex: APPROVED | Gemini: APPROVED | GLM: APPROVED  ✅ FULL SIGN-OFF
+### prep.md changes this round
+- Decision 5 (FAT cap -> uint32_t/VolumeClusterCount); new Decision 5b (isStreaming-scoped no-progress gate + non-streaming liveness pet + terminal-idle disarm).
+- Decision 10b (pre-session attempt cap ALSO cold-boot-cleared).
+- Plan step 4 (streaming-vs-non-streaming pet policy), step 9 (iteration/CP0 serial-drain).
+- Files-to-touch (+ SdFile.cpp/SdVolume.cpp + the waitNotBusy CP0 bound + CMD25 abort in Sd2Card.cpp).
+- Test plan static (a)/(d) updated to the isStreaming scoping + both caps cold-boot-cleared.
+- NOTE: Round 5 produced ONE convergent net-new BLOCKER (the non-streaming gate) + MINORs; no new architectural holes. Next round expected to converge.
 
-All three approve. Only non-blocking MINORs remain (carry to /grill):
-- Gemini: `sdBusRecover` is `static` in SD_Card_Stuff.ino; the .ino concatenation auto-prototypes it,
-  but if a toolchain version mis-handles the static prototype, add a forward decl or drop `static`.
-  (Note: sdBusRecover is only called within SD_Card_Stuff.ino — writeCache + soft-WDT — so this is a
-  belt-and-braces verification point.)
-- GLM: explicitly document + bench-verify that a bailed `spiBlockBounded` (leaves ENHBUF on) relies
-  entirely on the recovery owner's `sdSpiModuleFlush()` to restore standard mode. No code change.
+## Round 6 — Codex: APPROVED | Gemini: CHANGES_REQUESTED
+### Codex findings
+1. [MINOR] Stale WDT-lifetime wording in the DefaultBoard.ino touch-list summary ("arm-on-stream + single top-of-loop pet (NO disarm)") conflicts with the converged design. Update so /grill doesn't implement the obsolete round-2/3 model.
+(Codex VERDICT: APPROVED — no BLOCKER/MAJOR.)
+### Gemini findings
+1. [MAJOR] Disarming the WDT on a clean user stop leaves subsequent same-power-cycle sessions unprotected — a clean stop ('s') returns to command-idle to await the next 'b'; since the WDT is armed only in setup(), a later 'b' streams with the WDT off. Disarm ONLY at true terminal traps (ledReplayFail); command-idle already pets safely via !isStreaming.
+2. [MAJOR] Pre-session attempt cap acts as a global warm-boot limit, ruining multi-hour salvage — it increments on every warm reset before SD access and clears only on cold boot; every mid-recording WDT hang recovery IS a warm reset, so N nightly recoveries accumulate it and falsely trip ledReplayFail. Clear it immediately after the early SD-recovery phase (card.init + resume decision) succeeds, so it only accrues on a hang WITHIN that phase.
+3. [MAJOR] Internal WDT pets inside bounded loops bypass the no-progress gate and mask livelocks — pets inside waitNotBusy/FAT walks run on local sub-progress without the global gate; a wedged-but-retrying SD write keeps feeding the WDT forever, defeating the no-progress trap. ALL pets while isStreaming must be subject to lastProgressCP0 — use one centralized petWDT() enforcing isStreaming ? (CP0-lastProgressCP0 < deadline) : true at every site.
+4. [MINOR] lastProgressCP0 init gap on streaming start — the deadline goes active when isStreaming flips true; a stale lastProgressCP0 instantly trips it before the first sample. Set lastProgressCP0=CP0 in the 'b' start handler.
 
-### Outcome
-Plan converged after **9 adversarial rounds** (Codex + Gemini + GLM). Verdict history:
-R1 CCC · R2 CCC · R3 CC(GLM empty) · R4 CCC · R5 CCC · R6 CC**A** · R7 C**AA** · R8 **A**C**A** · R9 **AAA**.
-(C=CHANGES_REQUESTED, A=APPROVED). The hardest issues were hardware-level (ENH_BUFFER FIFO overrun
-diagnosis, the mid-CMD25 desync recovery via the existing sdBusRecover, the fault-latch lifecycle,
-the ON=0/ENHBUF write-ordering, and the happy-path SCK-glitch regression that a fix introduced and
-the next round caught). prep.md is the final deliverable; ready for /grill.
+### Resolution (Claude)
+- Codex APPROVED (only a wording MINOR). Gemini raised 3 genuinely net-new MAJORs — sharp interaction bugs in the round-4/5 pet model — ALL ACCEPTED:
+- **Gemini#3 (internal pets bypass the gate) — ACCEPTED, the key unifier.** Decision 5b rewritten around ONE centralized petWDT() inline: `if(!isStreaming){clear;return;} if((int32_t)(CP0-lastProgressCP0)<NO_PROGRESS_TICKS) clear;`. The no-progress gate now applies at EVERY streaming pet site (top-of-loop AND inside waitNotBusy/FAT walks), so a retry-storm with no block written stops petting -> reset. This supersedes the round-3/4 "pet inside bounded loops on local sub-progress" (which let a wedged retry feed the WDT forever).
+- **Gemini#1 (disarm on clean stop) — ACCEPTED.** Disarm ONLY at a terminal trap (ledReplayFail), NOT on clean stop 's'; command-idle keeps the WDT armed+petted via the !isStreaming branch so the next 'b' is protected.
+- **Gemini#2 (attempt cap defeats salvage) — ACCEPTED.** The pre-session attempt cap now clears the instant card.init+resume-decision SUCCEED (not "clean streaming start"), so a mid-recording hang recovery re-inits the card and clears it; only contiguous EARLY-PHASE failures accrue. The resume-thrash cap (separate) bounds the salvage chain. (Cold-boot clear retained.) The two caps are now cleanly separated.
+- **Gemini#4 (init gap) — ACCEPTED.** lastProgressCP0=readCP0() set when isStreaming flips true (the 'b' handler).
+- **Codex#1 (wording) — ACCEPTED.** DefaultBoard.ino touch-list summary updated to the converged petWDT()/terminal-disarm model.
+
+### prep.md changes this round
+- Decision 5b fully rewritten around the centralized petWDT() inline (global no-progress gate at all sites; disarm-only-at-terminal-trap; lastProgressCP0 re-stamp on stream start).
+- Decision 10b: attempt cap clears on early-phase SUCCESS (+ cold boot), cleanly separated from the resume-thrash cap.
+- Plan step 4 + Files-to-touch (DefaultBoard.ino) + Test plan static (a)/(d) all updated.
+- Codex APPROVED this round; remaining work is to confirm Gemini's 3 MAJORs are cleanly resolved (round 7).
+
+## Round 7 — Codex: APPROVED | Gemini: CHANGES_REQUESTED
+### Codex findings
+1. [MINOR] Stale local-progress wording in Decision 5 ("pet inside bounded loops on their CP0/iteration sub-progress") would conflict with 5b's centralized petWDT() gate if implemented literally. Reword to "call centralized petWDT() at CP0/iteration checkpoints."
+(Codex VERDICT: APPROVED — no BLOCKER/MAJOR, 2nd consecutive approval.)
+### Gemini findings
+1. [MAJOR] lastProgressCP0 init gap on AUTO-RESUME — the 'b' handler re-stamp is correct, but a WDT-recovered board auto-resumes streaming from setup()/replaySessionFile(), flipping isStreaming true WITHOUT going through 'b'; the CP0 ticks accumulated during the long FAT recovery walk instantly trip the no-progress gate on the first loop() -> immediate false reset -> infinite recovery loop. Mandate lastProgressCP0=readCP0() wherever isStreaming is set true, including auto-resume.
+2. [MAJOR] Un-petted delay() during the WDT-armed resume scrub — Decision 10c issues ADS SDATAC/reset after the WDT is armed; standard ADS reset uses hard delay() (>100ms oscillator settle) that doesn't pet -> with a short WDTPS it exceeds the timeout -> false reset -> infinite recovery boot-loop. Replace any delay() in the WDT-armed setup/scrub with a petted CP0-bounded wait loop.
+3. [MINOR] Stale wording in Decision 10b ("CP0-progress pet discipline covering card.init/FAT") contradicts 5b (non-streaming phases pet unconditionally). Align the wording.
+
+### Resolution (Claude)
+- Codex APPROVED for the 2nd consecutive round. Gemini's two MAJORs are both real and both LOCALIZED applications of already-approved principles (not new architecture) — ALL ACCEPTED:
+- **Gemini#1 (lastProgressCP0 on auto-resume) — ACCEPTED.** Decision 5b now mandates lastProgressCP0=readCP0() at EVERY isStreaming->true site (the 'b' handler AND the auto-resume replaySessionFile path), via a single helper that sets both together. The auto-resume path was the dangerous omission (long FAT walk -> stale CP0 -> instant false reset).
+- **Gemini#2 (un-petted delay in armed window) — ACCEPTED.** Decision 10c(e) added: NO bare un-petted delay()/spin between WDT-arm and the first loop(); the ADS reset/SDATAC settle delays become CP0-bounded petWDT() loops (the unconditional non-streaming branch feeds them); /grill audits for any bare delay() in the armed window.
+- **Gemini#3 + Codex#1 (wording) — ACCEPTED.** Decision 5 reworded to "call centralized petWDT() at CP0/iteration checkpoints"; Decision 10b reworded to "the unconditional non-streaming petWDT() covering card.init/FAT" (aligns with 5b).
+- Test plan static (a) augmented: re-stamp at every isStreaming->true site + no bare un-petted delay() in the armed window.
+
+### prep.md changes this round
+- Decision 5 (wording -> centralized petWDT()); Decision 5b (lastProgressCP0 at EVERY stream-start incl. auto-resume); Decision 10b (wording -> unconditional non-streaming pet); Decision 10c (e) added (no un-petted delay() in the WDT-armed window); Test plan static (a) augmented.
+- NOTE: nominal prep backstop is 7 rounds and this is round 7. Extending to ONE confirmation round (8) is justified: Codex has approved twice, Gemini's remaining items are localized mechanical applications of already-approved rules (not architecture), so a clean dual sign-off is within reach and worth capturing on no-ICSP, brick-risk hardware.
+
+## Round 8 (confirmation) — Codex: APPROVED | Gemini: APPROVED  ✅ DUAL SIGN-OFF
+### Codex findings
+(none — VERDICT: APPROVED)
+### Gemini findings
+(none — confirmed all round-7 fixes fully integrated: Decision 5b lastProgressCP0 at every isStreaming->true site incl. auto-resume; 10c(e) bans un-petted delay() in the WDT-armed window; 5/10b wording aligned to the centralized petWDT() model. "The architecture is now comprehensively hardened, self-consistent, and robust against interrupt-disabled livelocks, mid-FAT-walk wedges, and edge-case boot-loops. No new architectural vulnerabilities or contradictions." VERDICT: APPROVED)
+
+### Resolution (Claude)
+BOTH Codex and Gemini APPROVED with no BLOCKER/MAJOR/MINOR findings. The plan is signed off.
+Rounds: 8 total (Codex approved rounds 6,7,8; Gemini approved round 8). The adversarial chain drove
+three full strategy revisions of the WDT design (disarm-around-ops -> never-pet-inside -> pet-inside-
+bounded-loops -> CP0-progress-gated centralized petWDT()) plus a long tail of interaction-bug fixes.
+Next step: /grill to implement prep.md (which will run its OWN full Codex+Gemini code-diff review).
