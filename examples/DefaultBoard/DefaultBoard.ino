@@ -177,7 +177,7 @@ void loop() {
 
   // Stage B WDT: pet every loop iteration (no-op until armed; CP0-recording-progress-gated while
   // streaming, unconditional otherwise). Arm on the transition INTO streaming (gated on the runtime
-  // FWDTEN==0 check) and stamp progress there so the ~4s no-progress deadline can't instantly trip
+  // FWDTEN==0 check) and stamp progress there so the ~20s no-progress deadline can't instantly trip
   // on the first sample. A WDT reset -> setup() -> replaySessionFile() auto-resume salvages the night.
   petWDT();
   {

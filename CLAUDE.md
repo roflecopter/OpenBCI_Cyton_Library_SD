@@ -276,9 +276,18 @@ night).** Design (WDT-primitive in the OBCI32_SD fork, archived `patches/wdt-sta
   EXISTING resumed-`%BOOT` **`rcv=`** field (rcv=1 => card was wedged => SD-write-path hang; rcv=0 =>
   non-SD hang) + **`resume=N`** counts the WDT recoveries. Removed Stage A's ` wd=` %BOOT readout (~304 B,
   job done) to make room.
-- **Build 118664 B (96%, 120 B free), RAM 11572 B.** Codex+Gemini both APPROVED (3 review rounds; R1
-  converged on a WDTPS-gate BLOCKER + a block-progress MAJOR, both fixed; R2 a disarm-at-idle MAJOR,
-  fixed + simplified). Audit: `grill-review-log.md` "STAGE B".
+- **Build 118772 B (96%, 12 B free — essentially at the flash ceiling), RAM 11572 B.** Codex+Gemini both
+  APPROVED after **3 standard + 3 DEEP review rounds + 1 confirmation = 7 rounds** (user asked to be extra
+  solid on the brick-risk WDT). The DEEP rounds (false-reset enumeration + an independent code-trace
+  subagent; salvage integrity; races/timing/wrap) caught real safety holes the standard rounds missed:
+  (a) the SD-ERROR-RECOVERY path ran armed-but-unfed — added `petWDT()` inside `sdBusRecover`'s two 2s
+  busy-waits + the 8s extended-recovery delay chunk; (b) the progress stamp was too broad in `waitNotBusy`
+  (also serves card.init → could mask a hang) → MOVED to `writeData()` on an ACCEPTED block only; (c) the
+  no-progress deadline 14s→**20s** to cover the full ~15.8s recovery cascade (had undercounted
+  sdBusRecover's 4s); (d) `wdtDisarm()` at closeSDfile start to protect FAT cleanup, GUARDED on
+  `!board.streaming` so a >12h multi-slot rollover (streaming stays true) keeps the WDT armed. Verified
+  safe: concurrency (no ISR touches WDT state; MIPS 32-bit access atomic), CP0-wrap, first-loop-after-arm,
+  and the salvage path (strictly better than the frozen Stage A). Audit: `grill-review-log.md` "STAGE B".
 - **⚠ NOT flashed** — user-gated. Verification = the user's overnight soak: SUCCESS = the night salvages
   across chained slots (resume=N counts recoveries) instead of dying at one 4.9h slot; a HEALTHY night must
   still return as ONE clean slot (no spurious WDT reset). Flash with the normal `pic32prog` (NEVER a

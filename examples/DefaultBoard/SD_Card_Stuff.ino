@@ -766,11 +766,15 @@ static void sdBusRecover(){
   // 2. Wait out programming-BUSY (card holds MISO low -> transfer returns 0x00) BEFORE the stop
   //    token: a 0xFD sent during BUSY is ignored. Clock 0xFF continuously while polling. Bounded.
   uint32_t t0 = millis();
-  while (!sdSpiFault && (uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && spiByteBounded(0xFF) != 0xFF) {}
+  // petWDT() inside these up-to-SD_RECOVER_BUSY_MS(2s) card-busy waits: 2s > the ~1s HW WDTPS, so
+  // without it a legit bus recovery (called from writeCache WHILE the WDT is armed) would false-reset
+  // (deep review R1). petWDT is CP0-progress-gated, so if this recovery genuinely hangs past the 20s
+  // no-progress deadline it stops petting -> WDT fires (millis may even halt here — CP0 doesn't).
+  while (!sdSpiFault && (uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && spiByteBounded(0xFF) != 0xFF) { petWDT(); }
   // 3. Stop-tran token ends the multi-block write; wait out its programming-BUSY.
   spiByteBounded(0xFD);
   t0 = millis();
-  while (!sdSpiFault && (uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && spiByteBounded(0xFF) != 0xFF) {}
+  while (!sdSpiFault && (uint32_t)(millis() - t0) < SD_RECOVER_BUSY_MS && spiByteBounded(0xFF) != 0xFF) { petWDT(); }
   // NOTE: 0xFD is the correct AND sufficient stop for an SPI multi-block WRITE (CMD25), which is the
   // only multi-block transfer this firmware ever issues during recording — so the wedge is always a
   // stuck CMD25. A CMD12 (which aborts a multi-block READ, CMD18) was considered and intentionally
@@ -1578,6 +1582,15 @@ boolean setupSDcard(char limit){
 
 
 boolean closeSDfile(){
+  // Disarm the WDT SYNCHRONOUSLY before a TERMINAL close only (deep review B, Codex #3 + the mid-session
+  // rollover caveat, deep review C). closeSDfile does FAT/directory + footer writes; on the terminal-stop
+  // path (performAbort -> streamStop sets board.streaming=false -> closeSDfile) the loop-edge wdtDisarm()
+  // hasn't run yet, so a WDT reset mid-FAT-cleanup could corrupt the volume. Disarm here to remove that
+  // window. ⚠ GUARDED on !board.streaming: closeSDfile is ALSO called at an end-of-slot rollover with
+  // streaming STILL TRUE (the ">12h, do not stop streaming" path) — disarming there would leave the WDT
+  // OFF for the rest of a multi-slot recording (no re-arm without a stream transition). So only the
+  // terminal (non-streaming) close disarms; the rollover close stays armed (its writes pet via writeData).
+  if (!board.streaming) wdtDisarm();
 
   if(fileIsOpen){
     // Clean close = "user said stop, do not auto-resume on next boot".
@@ -2066,7 +2079,13 @@ void writeCache(){
               // boundary lands). EXT_RECOVERY_CHUNK_MS / 1ms = N iterations.
               uint32_t chunkEnd = millis() + tuneExtRecoveryChunkMs;
               while ((int32_t)(chunkEnd - millis()) > 0) {
-                delay(1);
+                delay(1);   // ⚠ WDT: this delay value MUST stay << WDTPS (~1024ms) — the HW WDT is armed and
+                            // delay() does NOT pet it; petWDT() below only pets AFTER the delay. delay(1) is
+                            // safe; do NOT raise it near/over ~1s or a healthy recovery false-resets (deep review B).
+                petWDT();   // feed the ~1s HW WDT through the delay chunk (deep review R1): the chunk can be
+                            // ~500ms (tunable), and the surrounding card.init/writeStart don't pet between
+                            // chunks; petWDT (CP0-progress-gated, deadline 20s) keeps a legit slow recovery
+                            // alive while still tripping if it hangs past 14s.
                 // Drain host serial during the stall, feeding every byte to the escape
                 // matcher FIRST so the hardened stop reaches the user mid-stall — across
                 // ALL active transports (Serial0 + Serial1), not just the primary radio.
