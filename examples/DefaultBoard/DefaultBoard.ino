@@ -54,6 +54,22 @@ void performAbort();                    // safe top-level abort-close (escape st
 extern volatile uint8_t sdSpiFault;     // set by a bounded SPI primitive on SPIROV/deadline bail
 extern void sdSpiModuleFlush(void);     // atomic SPI1 flush (FIFO + SPIROV); CLEARS sdSpiFault
 
+// Hardware WDT auto-recovery (Stage B, prep.md) — the primitive lives in the OBCI32_SD fork
+// (so the SD block-write busy-wait can pet it during a >WDTPS wait). The sketch drives it:
+// arms it on stream-start (gated on the runtime FWDTEN==0 check below), pets at top-of-loop,
+// and bumps recording-progress on each sample. A WDT reset -> setup() -> the EXISTING
+// replaySessionFile() auto-resume salvages the night into the next slot.
+extern void petWDT(void);               // pet (top-of-loop + inside waitNotBusy); CP0-progress-gated
+extern void wdtProgress(void);          // bump the "last recording progress" CP0 stamp (each sample/block)
+extern void wdtArm(void);               // arm the WDT on stream-start (WDTCON.ON=1 + stamp); sketch gates it
+extern void wdtDisarm(void);            // disarm on stream-stop (WDTCON.ON=0) -> WDT OFF at idle (no false reset)
+boolean wdtEnableGate = false;          // set in setup(): true iff DEVCFG1 FWDTEN==0 (safe to arm)
+// NOTE: the persistent freeze-breadcrumb (` hp=<phase>` in %BOOT, to pinpoint the hang phase) was
+// designed for Stage B but does NOT fit this 96%-full fragmented flash — deferred to a focused
+// follow-up flash. In the meantime the EXISTING resumed-%BOOT `rcv=` field is a free coarse
+// discriminator: rcv=1 (sdBusRecover ran + card was wedged) => the hang left the card mid-CMD25 =>
+// SD-write path; rcv=0 => the card wasn't wedged => a non-SD hang. Plus `resume=N` counts the hangs.
+
 void setup() {
   // Capture MCU reset cause BEFORE anything that might touch RCON. Then clear
   // the sticky bits so the next reset's cause is unambiguous. NOTE: on the
@@ -62,6 +78,13 @@ void setup() {
   // bootloader fix lands.
   bootResetCause = RCON;
   RCONCLR = 0xFFFF;
+
+  // WDT OFF as the very first act (Stage B, defensive): if a prior WDT-timeout reset somehow left
+  // WDTCON.ON set (PIC32MX docs say ON reverts to FWDTEN=0 on any reset, but don't depend on it),
+  // clear it NOW so the whole setup()/replaySessionFile() resume path runs with the WDT disabled —
+  // it is re-armed only when steady streaming (re)starts. FWDTEN=0 means software owns ON, so this
+  // clear is always effective. Removes any infinite-reset risk during the long recovery path.
+  WDTCONCLR = _WDTCON_ON_MASK;
 
   // Boot counter — survives reset via EEPROM. Two consecutive recordings with
   // bootSeq differing by N>1 means the MCU reset N-1 times between sessions.
@@ -82,6 +105,18 @@ void setup() {
 
   resumeCount = EEPROM.read(7);
   if (resumeCount == 0xFF) resumeCount = 0;   // virgin EEPROM
+
+  // WDT runtime gate (Stage B): arm the hardware WDT ONLY if BOTH hold on the actual silicon —
+  //   (1) FWDTEN==0 (DEVCFG1 bit 23): WDT off at reset, software-controllable -> no infinite-reset brick.
+  //   (2) WDTPS >= 0x0A (DEVCFG1 bits 20:16): the HW timeout is >= ~1.02s, the value this design was
+  //       VALIDATED against. A board/bootloader-batch with a SMALLER postscale (e.g. 1-32ms) would
+  //       false-reset a healthy recording (a 512B block SPI transfer isn't petted mid-burst), so we
+  //       FAIL CLOSED (never arm) rather than risk it (Codex+Gemini review #1 BLOCKER). This board read
+  //       wd=0xFF6A0D5B -> WDTPS=0x0A -> passes; anything shorter ships as no-WDT (Stage A behaviour).
+  // Read-only KSEG1 boot-flash word.
+  uint32_t devcfg1 = *(volatile uint32_t *)0xBFC00BF8;
+  wdtEnableGate = ((devcfg1 & 0x00800000u) == 0u)             // FWDTEN==0
+               && (((devcfg1 >> 16) & 0x1Fu) >= 0x0Au);       // WDTPS >= 0x0A (~1s), the validated range
 
   // Park the SD chip-select HIGH (deselected) as raw GPIO BEFORE board.begin(). board.begin()
   // brings up the shared DSPI and clocks the ADS1299 over the SAME SCK/MOSI/MISO lines; if a
@@ -140,10 +175,28 @@ void loop() {
   // on a clean bus (the common case — writeCache's SPIROV branch already cleared the latch).
   if (sdSpiFault) sdSpiModuleFlush();
 
+  // Stage B WDT: pet every loop iteration (no-op until armed; CP0-recording-progress-gated while
+  // streaming, unconditional otherwise). Arm on the transition INTO streaming (gated on the runtime
+  // FWDTEN==0 check) and stamp progress there so the ~4s no-progress deadline can't instantly trip
+  // on the first sample. A WDT reset -> setup() -> replaySessionFile() auto-resume salvages the night.
+  petWDT();
+  {
+    static boolean wasStreaming = false;
+    if (board.streaming != wasStreaming) {
+      if (board.streaming) {           // stream just started (fresh 'b' OR a resumed session)
+        if (wdtEnableGate) wdtArm();   // arm + stamp progress (gated on FWDTEN==0 && WDTPS>=0x0A)
+      } else {
+        wdtDisarm();                   // stopped -> WDT OFF (a long idle command can't false-reset)
+      }
+      wasStreaming = board.streaming;
+    }
+  }
+
   if (board.streaming) {
     if (board.channelDataAvailable) {
       // Read from the ADS(s), store data, set channelDataAvailable flag to false
       board.updateChannelData();
+      wdtProgress();                   // Stage B: recording progress — a fresh sample was acquired+cached
 
       // Check to see if accel has new data
       if (board.curAccelMode == board.ACCEL_MODE_ON) {

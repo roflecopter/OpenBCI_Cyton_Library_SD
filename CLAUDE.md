@@ -249,3 +249,37 @@ again (the hang is NOT the ADS path → WDT+breadcrumb needed to locate it).
 `-a 16` sleep soak (the multi-hour freeze only reproduces on a real overnight run). Flash with the normal
 `pic32prog` invocation (**NEVER a kill-timeout** — that bricked Cyton A; let it run to "Verify flash … done").
 Artifact: `build-grill/DefaultBoard.ino.hex`.
+
+## Mid-recording HANG — Stage B: hardware WDT auto-recovery (2026-07-01) — built + Codex+Gemini APPROVED, NOT yet flashed
+Branch `grill/cyton-hang-stage-b` (off Stage A). **Stage A's SPI bounding did NOT stop the freeze** —
+the 2026-06-30 soak (`OBCI_62`) froze AGAIN at **4.9h, e=0 r=0**, same signature -> the hang is a
+**non-SPI MCU lockup**. Stage A's `wd=` readout delivered the gate: **wd=0xFF6A0D5B -> FWDTEN=0**
+(WDT off at reset, app can arm it, NO infinite-reset brick — on any reset WDTCON.ON reverts to FWDTEN=0)
+**+ WDTPS=0x0A (~1.02s) + WINDIS=1**.
+
+**What Stage B adds — a hardware watchdog that resets on the hang -> setup() -> the EXISTING
+`replaySessionFile()` auto-resume salvages the night across slots (dies-at-4.9h becomes a full salvaged
+night).** Design (WDT-primitive in the OBCI32_SD fork, archived `patches/wdt-stage-b.cpp`; driven by
+`DefaultBoard.ino`):
+- **Armed ONLY while recording** (arm on the stream-start transition, **disarm on stop** -> WDT hardware
+  OFF at idle so a long idle command can't false-reset). `WDTCONCLR` at `setup()` start keeps it off
+  through the whole setup/resume path. Gated on **FWDTEN==0 && WDTPS>=0x0A** (fail-closed: a board with a
+  shorter postscale ships as no-WDT = Stage A behaviour, never risks a false-reset).
+- **`petWDT()`** (top-of-loop + INSIDE `waitNotBusy`, so a legit 1.5s block write — > the ~1s WDTPS —
+  keeps the WDT fed) pets ONLY while recording progress is recent: `(CP0 - wdtLastProg) < 4s`. `CP0` is a
+  HARDWARE timer that ticks even under an interrupt lockup (which halts `millis()`), so the no-progress
+  gate catches THAT too. `wdtLastProg` bumped on each ADS sample **and each completed block**
+  (`waitNotBusy` success) so a multi-block flush can't false-trip. A genuine hang stops the bumps ->
+  petWDT stops -> the WDT fires (~5s: 4s deadline + ~1s WDTPS). `resumeCount` cap (25, clears on first
+  `%CKPT`) bounds any rapid loop; the real multi-hour hang salvages into 2-3 slots/night.
+- **Breadcrumb DEFERRED** (` hp=<phase>` didn't fit the 96%-full fragmented flash). Free substitute: the
+  EXISTING resumed-`%BOOT` **`rcv=`** field (rcv=1 => card was wedged => SD-write-path hang; rcv=0 =>
+  non-SD hang) + **`resume=N`** counts the WDT recoveries. Removed Stage A's ` wd=` %BOOT readout (~304 B,
+  job done) to make room.
+- **Build 118664 B (96%, 120 B free), RAM 11572 B.** Codex+Gemini both APPROVED (3 review rounds; R1
+  converged on a WDTPS-gate BLOCKER + a block-progress MAJOR, both fixed; R2 a disarm-at-idle MAJOR,
+  fixed + simplified). Audit: `grill-review-log.md` "STAGE B".
+- **⚠ NOT flashed** — user-gated. Verification = the user's overnight soak: SUCCESS = the night salvages
+  across chained slots (resume=N counts recoveries) instead of dying at one 4.9h slot; a HEALTHY night must
+  still return as ONE clean slot (no spurious WDT reset). Flash with the normal `pic32prog` (NEVER a
+  kill-timeout). Artifact: `build-grill/DefaultBoard.ino.hex`.

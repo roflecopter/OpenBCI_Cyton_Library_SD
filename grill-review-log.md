@@ -90,3 +90,79 @@ build-verified firmware, committed, ready to flash. Post-deploy verification (Ac
 overnight soak (the multi-hour freeze is only reproducible on a real overnight run; cannot be done here).
 Flash artifact: build-grill/DefaultBoard.ino.hex. Flash cmd (NEVER a kill-timeout):
   /home/lst/.arduino15/packages/chipKIT/tools/pic32prog/v2.1.46/pic32prog -d /dev/ttyUSB0 -b 115200 <hex>
+
+## FLASHED 2026-06-30 — Cyton B, clean verify ✅
+Dongle reconnected (/dev/ttyUSB0, FTDI 0403:6015); collect-bci inactive. Flashed
+build-grill/DefaultBoard.ino.hex via pic32prog (detached / NO kill-timeout — the cardinal rule),
+caught the bootloader window first try (no reset tap needed):
+  Erase: done | Program flash: ############ done | Verify flash: ############ done | 796 B/s | EXIT=0
+Data 119756 bytes. Clean verify (contrast Cyton A's repeatable verify failures). Firmware on the board.
+Functional verification = the USER's overnight `-a 16` soak (the multi-hour freeze only reproduces on a
+real run) — move the dongle switch OFF reset first. Then pull the card and report: (a) the %BOOT wd=0x
+value (reveals FWDTEN+WDTPS for the deferred Stage-B WDT decision), (b) clean full slot past 7h (Phase 0
+fixed it) vs another mid-sample truncation (hang not the ADS path → build Stage B).
+
+# ===== STAGE B — hardware WDT auto-recovery (2026-07-01) =====
+Branch grill/cyton-hang-stage-b (off Stage A). CONTEXT: Stage A flashed + soaked -> OBCI_62 froze
+AGAIN at 4.9h (e=0 r=0, same signature) -> the hang is NOT the ADS SPI path. The %BOOT wd= readout
+delivered the gate: wd=0xFF6A0D5B -> FWDTEN=0 (WDT arm-able, no brick) + WDTPS=0x0A (~1.02s) + WINDIS=1.
+
+## Build summary (Stage B)
+- Removed Stage A's ` wd=0x` %BOOT readout (~304 B — it did its job) to reclaim flash for the WDT.
+- WDT-only build: **118536 B (96%, 248 B free under 118784), RAM 11572 B**.
+- Breadcrumb DEFERRED: designed but overflows this fragmented flash; the EXISTING resumed-%BOOT `rcv=`
+  field is a free coarse substitute (rcv=1 => card wedged => SD-write-path hang; rcv=0 => non-SD hang;
+  resume=N counts the hangs).
+
+## Design (WDT-only, minimal-robust)
+- The WDT primitive lives in the OBCI32_SD fork (Sd2Card.cpp) so the SD block-write busy-wait
+  (waitNotBusy, up to 1500ms > the ~1s WDTPS) can pet it from INSIDE the wait — else one legit slow
+  block write false-resets. `petWDT()`: unconditional pet while NOT streaming; while streaming, pet
+  ONLY if recording progress (a sample) is within wdtNoProgTicks=4s (CP0, HW-timer, halt-proof). A
+  genuine hang stops bumping progress -> petWDT stops -> WDT fires -> reset -> EXISTING
+  replaySessionFile() auto-resume salvages the night into the next slot.
+- Armed on the stream-start transition (gated on the runtime FWDTEN==0 read), NOT during setup/resume
+  (those are already CP0/millis-bounded by Stage A + the SPIROV fix, so they can't freeze; and after a
+  WDT reset FWDTEN=0 makes WDTCON.ON revert to 0 -> the WDT is OFF through setup/resume automatically,
+  then re-arms on stream-start). resumeCount cap (25, clears on first %CKPT) bounds any rapid loop.
+- Static checks all pass (arm-gated on FWDTEN==0; petWDT at top-of-loop + inside waitNotBusy; progress
+  stamped on stream-start + each sample; 4s deadline > 1.5s worst write; WDTCON masks correct).
+
+## Stage B — Review round 1 — Codex: CHANGES_REQUESTED | Gemini: CHANGES_REQUESTED
+Both CONVERGED on the same BLOCKER + MAJOR (strong signal):
+### Findings (Codex / Gemini)
+1. [BLOCKER, both] Arm gate ignores WDTPS — only checks FWDTEN==0. A variant board/bootloader with a SMALLER postscale (1-32ms) would false-reset a healthy recording (a 512B block SPI burst isn't petted mid-transfer). Gate on WDTPS too.
+2. [MAJOR, both] wdtProgress bumped only on ADS samples, not block writes — a legit multi-block flush (data+FAT+dir, each up to SD_WRITE_TIMEOUT=1.5s) with no sample between can exceed the 4s no-progress deadline -> false-reset mid-write. Bump progress on each block completion (or raise the deadline).
+### Resolution (orchestrator) — all ACCEPTED
+- **BLOCKER (WDTPS gate) — FIXED.** wdtEnableGate now = (FWDTEN==0) && (WDTPS=(devcfg1>>16)&0x1F) >= 0x0A. Only arms if the HW timeout is >= the validated ~1s; a shorter-postscale board fails closed (ships no-WDT = Stage A behaviour), never risking a false-reset brick. This board (WDTPS=0x0A) passes.
+- **MAJOR (block-completion progress) — FIXED.** wdtProgress() now stamps in waitNotBusy's success path (r==0xFF = card ready = a block/op completed). A multi-block flush keeps the deadline fresh; a HUNG write never reaches the success path -> no stamp -> the deadline still trips -> WDT fires. Preserves hang detection.
+- **Defensive (proactive):** WDTCONCLR=_WDTCON_ON_MASK as the first act of setup() — the WDT is OFF through the whole setup/replaySessionFile resume path regardless of the "ON reverts to FWDTEN on reset" assumption; re-armed only on stream-start.
+### Tests after this round
+Build green: 118572 B (96%, 212 B free), RAM 11572 B. WDTCONCLR compiles in the sketch (SFR mask available).
+
+## Stage B — Review round 2 — Codex: APPROVED | Gemini: CHANGES_REQUESTED
+### Findings
+- Codex: APPROVED (round-1 fixes confirmed real).
+- Gemini [MAJOR]: WDT stays armed after stream-stop -> a long idle command (e.g. `?` register dump) blocking loop() >WDTPS without petWDT would false-reset. Since FWDTEN=0, software can/should disable the WDT when idle; then wdtStreaming + the unconditional-pet branch can be removed entirely.
+### Resolution (orchestrator) — ACCEPTED (also simplifies)
+- Disarm the WDT on stream-stop (new wdtDisarm(): WDTCONCLR ON + wdtArmed=0). The WDT is now armed ONLY while recording -> at idle it is HARDWARE OFF -> no idle-command false-reset. Re-armed on the next stream-start (subsequent same-power-cycle recordings are protected). Removed wdtStreaming + wdtSetStreaming + the non-streaming unconditional-pet branch: "armed" == "streaming", so petWDT is just `if(!armed) return; if(progress recent) pet;`. wdtArm() now stamps progress on arm (folds in the init-gap guard).
+### Tests after this round
+Build green: 118664 B (96%, 120 B free), RAM 11572 B.
+
+## Stage B — Review round 3 — Codex: APPROVED | Gemini: APPROVED  ✅ DUAL SIGN-OFF
+- Gemini: APPROVED (the disarm-on-stop fix confirmed).
+- Codex: first returned a spurious CHANGES_REQUESTED that was NOT a code finding — a transient sandbox
+  glitch ("the firmware tree is not visible... I cannot verify"; it read the repo fine in R1-R2). Re-ran
+  Codex with the code inline-only -> APPROVED. No net-new code findings from either reviewer.
+### Resolution
+Stage B signed off in 3 rounds. Both reviewers converged R1 on the two real safety holes (WDTPS gate,
+block-completion progress), both fixed; Gemini's R2 disarm-at-idle MAJOR fixed + simplified; R3 both APPROVED.
+### Tests after this round
+Build green: 118664 B (96%, 120 B free under the 118784 ceiling), RAM 11572 B.
+
+## Deploy = FLASH (USER-GATED — not performed by /grill)
+Same as Stage A: the flash is the irreversible, brick-risk, user-gated step. Board dongle is connected
+(/dev/ttyUSB0) but the flash needs the user's explicit OK. Post-deploy verification = the user's overnight
+soak: SUCCESS = the night SALVAGES across chained slots (OBCI_63/64...) with resume=N counting the WDT
+recoveries + rcv= discriminating SD-path vs non-SD hangs — instead of dying at one 4.9h slot. A healthy
+night must still return as ONE clean slot (no spurious WDT resets). Artifact: build-grill/DefaultBoard.ino.hex.
