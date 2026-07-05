@@ -129,7 +129,15 @@ static uint8_t escMatchIdx = 0;      // leading token bytes matched so far
 // unlimited retries; with cap=25 a true card-death scenario still idles instead
 // of thrashing the SD until physical exhaustion. EEPROM[7] is uint8 with 0xFF
 // reserved as virgin sentinel — anything <= 254 is safe.
-#define DEFAULT_MAX_RESUMES              25
+//
+// LOWERED 25 -> 3 on 2026-07-05 (/work RCA, Codex+Gemini). Auto-resume is kept (it salvages a real
+// firmware-hang night on the now-solid/hardwired power rail), but 25 allowed a PATHOLOGICAL thrash:
+// if the underlying freeze bug re-triggers right after a resume, the board could reset→resume up to
+// 25× in a row, hammering the SD with FAT/erase current spikes (the brownout-death-loop cousin) and
+// fragmenting the night. A cap of 3 lets a genuine hang salvage a couple of times, then IDLES (partial
+// preserved) instead of thrashing. Per-good-CKPT reset still gives a healthy night effectively
+// unlimited *spaced* retries — this only bounds BACK-TO-BACK resets.
+#define DEFAULT_MAX_RESUMES              3
 // Extended in-place recovery window before falling back to slot recreation
 // (executeSoftReset). Added 2026-05-13. Inline writeStart retry (5x) + one
 // card.init+writeStart already covers brief stalls; this extends with a
@@ -486,16 +494,26 @@ uint8_t applyTune(uint8_t key, uint32_t val) {
       // max EEPROM[7] can hold (0xFF reserved as virgin sentinel).
       if (val < 1 || val > 254) return 2;
       tuneMaxResumes = (uint8_t)val;
-      // If EEPROM[7] (resumeCount) is already ≥ new cap, reset to 0 to
-      // preserve "raise the cap" intent. The ROADMAP flagged this case:
-      // without the reset, lowering MAX_RESUMES at runtime would
-      // immediately lock out auto-resume. Guarded read-then-write so a
-      // host re-tuning to the same value repeatedly doesn't burn EEPROM
-      // write cycles on a no-op.
+      // If EEPROM[7] (resumeCount) is already ≥ new cap, reset to 0 to preserve "raise the cap" intent.
+      // The ROADMAP flagged this case: without the reset, lowering MAX_RESUMES at runtime would
+      // immediately lock out auto-resume. Guarded read-then-write so a host re-tuning to the same value
+      // repeatedly doesn't burn EEPROM write cycles on a no-op.
+      // ⚠ MUST run against the ORIGINAL requested `val`, BEFORE the hard-ceiling clamp below (Codex+Gemini
+      // /work R2 BLOCKER): applyTune() is reached on EVERY resume via the SESSION.TXT %TUNE replay, and
+      // the host sends max_resumes=25. If we clamped to 3 FIRST, this reset would then see `rc >= 3` and
+      // fire at the 3rd resume — clearing the counter to 0 every 3 resumes → an INFINITE back-to-back
+      // thrash loop (the exact pathology the cap exists to prevent). Comparing against 25 keeps
+      // `rc(≤3) >= 25` FALSE, so the counter accumulates to the cap and the board idles.
       {
         uint8_t rc = EEPROM.read(7);
         if (rc != 0xFF && rc != 0 && rc >= tuneMaxResumes) EEPROM.write(7, 0);
       }
+      // HARD CEILING (2026-07-05, /work RCA): applyTune() is the ONLY setter of tuneMaxResumes, reached
+      // by BOTH the host 'T' wire command AND the SESSION.TXT %TUNE line. The host sends max_resumes=25
+      // (seen in OBCI_64's SESSION.TXT); clamp so a tune can LOWER the cap but never RAISE it above
+      // DEFAULT_MAX_RESUMES(=3). Applied AFTER the reset check above (see the ⚠ note). The admission
+      // gate (rc >= tuneMaxResumes) then enforces ≤3. Still ACK "TUNE OK" — the host's intent is met.
+      if (tuneMaxResumes > DEFAULT_MAX_RESUMES) tuneMaxResumes = DEFAULT_MAX_RESUMES;
       return 0;
     case TUNE_KEY_EXT_RECOVERY_WINDOW_MS:
       // 0 would disable the extended window entirely (degrading recovery

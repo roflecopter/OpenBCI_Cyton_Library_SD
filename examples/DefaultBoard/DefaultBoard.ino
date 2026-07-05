@@ -213,6 +213,15 @@ void loop() {
 
       // Verify the SD file is open
       if(SDfileOpen) {
+        // SPI bus-settle delay (2026-07-05, /work RCA Codex+Gemini): the ADS read just finished
+        // (csHigh BOARD_ADS) and the SD write is about to select the card (csLow SD_SS) on the SAME
+        // hardware SPI1. A ~5µs settle lets the shared bus quiesce (covers ~3 RC time-constants if MISO
+        // floats to a weak pull-up after the ADS releases it) before the SD transaction, in case the
+        // mid-recording freeze is a shared-SPI/peripheral state race (a candidate cause). Cost ~0.25%
+        // of the 2ms/sample budget at 500Hz; the WDT is CP0-progress-gated (20s) so 5µs is irrelevant
+        // to it. No-op if the freeze is actually an exception (then the breadcrumb catches it). The
+        // SD→ADS return edge needs no delay — it naturally spans a sample boundary (~1ms+ to next DRDY).
+        delayMicroseconds(5);
         // Write to the SD card, writes aux data
         writeDataToSDcard(board.sampleCounter);
       }
