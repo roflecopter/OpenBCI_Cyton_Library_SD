@@ -292,3 +292,25 @@ night).** Design (WDT-primitive in the OBCI32_SD fork, archived `patches/wdt-sta
   across chained slots (resume=N counts recoveries) instead of dying at one 4.9h slot; a HEALTHY night must
   still return as ONE clean slot (no spurious WDT reset). Flash with the normal `pic32prog` (NEVER a
   kill-timeout). Artifact: `build-grill/DefaultBoard.ino.hex`.
+
+## 2026-07-06: flashable-baseline fix (HEAD) + exception breadcrumb DEFERRED (infeasible)
+
+Current flashable HEAD = **`fb8b9cf`** (RECOVER payload: Stage-B WDT salvage + MAX_RESUMES=3 + SPI settle),
+**118520 B, 264 B free** under the real 118784 B ceiling, links cleanly. **NOT flashed** (user-gated).
+
+- **⚠ The committed `e3e46c9` was 8 B OVER the ceiling → it did NOT link / could not be flashed.** The
+  `delayMicroseconds(5)` SPI-settle add in that commit tipped it past 118784 and it was never
+  link-verified. `fb8b9cf` fixes it by trimming **5 host-UNPARSED strings** (`PERSIST ERR EMPTY/TOOBIG`,
+  the `PERSIST FAIL` step-number detail, `"invalid BLOCK count"`, `"No open file to close"`). All keep
+  their `board.sendEOT()` / control flow; host contract intact (Codex+Gemini APPROVED, host-audited —
+  those strings are docstring-only in `p_cmd_helper.py` or have zero host matches). The `g=0x` resume
+  diagnostic is KEPT. **Lesson: link-verify EVERY firmware commit — arduino-cli's "122880 max" lies; the
+  real gate is 118784 B, and this image is 96%-full + fragmented.**
+- **The forensic exception breadcrumb (crash_handler.c) is INFEASIBLE on this image and was DEFERRED**
+  (user chose RECOVER-only). It needs **~760 B**: a strong `_general_exception_handler` override defeats
+  `gc-sections`' stripping of the chipKIT core exception-vector machinery — 268 B over even after
+  reclaiming every non-contract string. To ship it later, first free ~300 B (drop accel, or brick-risky
+  DEE/splitflash linker surgery on this no-ICSP board). WIP preserved: `patches/exception-breadcrumb-*`.
+  Audit: `grill-breadcrumb-review-log.md` + `prep-breadcrumb.md`.
+- Freeze still **RECOVERS** without the breadcrumb (WDT → `replaySessionFile` salvage; `rcv=`/`resume=N`
+  in the resumed `%BOOT` say SD-path-vs-not + recovery count). Only in-firmware LOCATE is deferred.
