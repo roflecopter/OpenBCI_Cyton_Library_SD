@@ -328,13 +328,13 @@ boolean sdPersistProcess(char c){
     sessLen |= ((uint16_t)(uint8_t)c) << 8;
     if (sessLen == 0) {
       sessState = 0;
-      if (!replayingSession) { Serial0.println("PERSIST ERR EMPTY"); board.sendEOT(); }
+      if (!replayingSession) { board.sendEOT(); }   /* host-unparsed string trimmed to bring the image back under the 118784 B ceiling (HEAD was 8 B over after the SPI-settle add) */
       return true;
     }
     if (sessLen > 1024) {
       sessLen   = 1024;        // drain at most a sane max so spurious bytes can't leak
       sessState = 4;
-      if (!replayingSession) { Serial0.println("PERSIST ERR TOOBIG"); board.sendEOT(); }
+      if (!replayingSession) { board.sendEOT(); }   /* host-unparsed string trimmed to bring the image back under the 118784 B ceiling (HEAD was 8 B over after the SPI-settle add) */
       return true;
     }
     sessTotal = sessLen;
@@ -412,11 +412,11 @@ boolean sdPersistProcess(char c){
           Serial0.print(" ");
           Serial0.println(sessSum);
         } else {
-          // Emit pfail step code so the host can see which SD step failed:
-          // 1=card/volume init, 2=root open, 3=file open, 4=hdr write,
-          // 5=payload write, 6=footer write.
-          Serial0.print("PERSIST FAIL ");
-          Serial0.println(pfail);
+          // "PERSIST FAIL" (contract token) kept; the pfail step-code detail number DROPPED to bring the
+          // image back under the 118784 B ceiling — host-unparsed (only "PERSIST OK" is regexed by the
+          // host; failure is inferred from its absence). pfail step map was: 1=init 2=root 3=fileopen
+          // 4=hdr 5=payload 6=footer.
+          Serial0.println("PERSIST FAIL");
         }
         board.sendEOT();
       }
@@ -1356,8 +1356,7 @@ boolean setupSDcard(char limit){
       BLOCK_COUNT = BLOCK_24HR/BLOCK_DIV; break;
     default:
       if(!board.streaming) {
-        Serial0.println("invalid BLOCK count");
-        board.sendEOT(); // Write end of transmission because we exit here
+        board.sendEOT(); /* "invalid BLOCK count" host-unparsed string trimmed to fit the 118784 B ceiling; EOT still sent */
       }
       return fileIsOpen;
   }
@@ -1571,6 +1570,7 @@ boolean setupSDcard(char limit){
     // the 2026-06-30 soak reported wd=0xFF6A0D5B => FWDTEN=0 (WDT arm-able) + WDTPS=0x0A (~1.02s). Stage B
     // now reads DEVCFG1 at runtime for the WDT arm-gate (DefaultBoard.ino), so the file readout is
     // redundant; removing it (~304 B) reclaims the flash the hardware WDT needs on this 96%-full image.)
+
     EMIT_BYTE('\n');
 
     #undef EMIT_HEX16
@@ -1658,8 +1658,7 @@ boolean closeSDfile(){
 
   }else{
     if(!board.streaming) {
-      Serial0.println("No open file to close");
-      board.sendEOT();
+      board.sendEOT(); /* "No open file to close" host-unparsed string trimmed to fit the 118784 B ceiling */
     }
     
   }
