@@ -1,0 +1,39 @@
+diff --git a/examples/DefaultBoard/DefaultBoard.ino b/examples/DefaultBoard/DefaultBoard.ino
+index f9dced3..5f3346d 100644
+--- a/examples/DefaultBoard/DefaultBoard.ino
++++ b/examples/DefaultBoard/DefaultBoard.ino
+@@ -70,6 +70,17 @@ boolean wdtEnableGate = false;          // set in setup(): true iff DEVCFG1 FWDT
+ // discriminator: rcv=1 (sdBusRecover ran + card was wedged) => the hang left the card mid-CMD25 =>
+ // SD-write path; rcv=0 => the card wasn't wedged => a non-SD hang. Plus `resume=N` counts the hangs.
+ 
++// Forensic exception breadcrumb (2026-07-05, /work — see prep-breadcrumb.md). The handler + the
++// `.noinit` crash record live in crash_handler.c (a strong unmangled C symbol overriding the chipKIT
++// weak _general_exception_handler). extern "C" so C++ resolves the unmangled name.
++extern "C" {
++  struct CrashRec { uint32_t cause; uint32_t epc; uint32_t badv; uint32_t magic; };
++  extern struct CrashRec g_crash;
++}
++#define CRASH_MAGIC 0x0BC1FA17u
++uint32_t excCause = 0, excEpc = 0;   // captured fault (cause+epc), surfaced in %BOOT
++boolean  excValid = false;                        // a crash breadcrumb is pending emit
++
+ void setup() {
+   // Capture MCU reset cause BEFORE anything that might touch RCON. Then clear
+   // the sticky bits so the next reset's cause is unambiguous. NOTE: on the
+@@ -106,6 +117,16 @@ void setup() {
+   resumeCount = EEPROM.read(7);
+   if (resumeCount == 0xFF) resumeCount = 0;   // virgin EEPROM
+ 
++  // Forensic exception breadcrumb read (SAFE normal context, before any RAM churn). crash_handler.c
++  // captured the fault into the .noinit record and soft-reset; .noinit survives that warm reset (it's
++  // orphaned after _bss_end — verified). Do NOT clear here — cleared only after the %BOOT emit (a boot
++  // that never opens a slot keeps it). [The EEPROM power-cycle backup was DROPPED for flash budget — /work
++  // prep staged fallback: .noinit covers the exception→soft-reset→resume→%BOOT path, which is the case
++  // we care about; a power-cycle before emit loses that one breadcrumb. See prep-breadcrumb.md Dec 6.]
++  if (g_crash.magic == CRASH_MAGIC) {
++    excCause = g_crash.cause; excEpc = g_crash.epc; excValid = true;   // badv captured in .noinit, not emitted
++  }
++
+   // WDT runtime gate (Stage B): arm the hardware WDT ONLY if BOTH hold on the actual silicon —
+   //   (1) FWDTEN==0 (DEVCFG1 bit 23): WDT off at reset, software-controllable -> no infinite-reset brick.
+   //   (2) WDTPS >= 0x0A (DEVCFG1 bits 20:16): the HW timeout is >= ~1.02s, the value this design was
