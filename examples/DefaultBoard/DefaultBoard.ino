@@ -196,7 +196,17 @@ void loop() {
     if (board.channelDataAvailable) {
       // Read from the ADS(s), store data, set channelDataAvailable flag to false
       board.updateChannelData();
-      wdtProgress();                   // Stage B: recording progress — a fresh sample was acquired+cached
+      // ⛔ DO NOT stamp wdtProgress() here. (Was: "a fresh sample was acquired+cached".)
+      // An ADS sample is NOT recording progress — it only proves the analog frontend + DRDY ISR
+      // are alive. Stamping every sample (~2 ms @500 Hz) kept petWDT() feeding the watchdog even
+      // when the SD write path had completely stalled, so the WDT could NEVER fire on the real
+      // failure mode. That is exactly how OBCI_66 died (2026-07-07): board alive + blinking, ADS
+      // acquiring clean samples, SD writes dead at 5.2 h, e=0 r=0, resume=0, no continuation slot.
+      // The ONLY recording-progress stamp is wdtProgress() in Sd2Card.cpp writeData(), on a block
+      // ACCEPTED by the card — matching the wdtNoProgTicks (20 s) deadline, which is sized to exceed
+      // the longest LEGIT no-block stretch (the full SD-error-recovery cascade, ~15.8 s).
+      // A stalled write now ages wdtLastProg -> petWDT stops -> WDT resets -> replaySessionFile()
+      // salvages the rest of the night into a fresh chained slot.
 
       // Check to see if accel has new data
       if (board.curAccelMode == board.ACCEL_MODE_ON) {
