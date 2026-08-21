@@ -124,3 +124,20 @@ reconstruction, no-ICSP brick risk, mandatory Codex+Gemini panel per repo CLAUDE
 - **Library:** `OpenBCI_32bit_Library.{cpp,h,_Definitions.h}` @ `e8f8f63` + the 250 Hz `!sdFileOpen` gate.
 - **SD driver:** `OpenBCI_32bit_SD/utility/Sd2Card.{cpp,h}` @ pristine `0b37db3` (== upstream `4bcbc3b`) − `#include <plib.h>`.
 - Built ISOLATED via `ARDUINO_DIRECTORIES_USER=/home/lst/board3-build` (Cyton B's shared libs untouched).
+
+## HARDWARE VERIFICATION (on board #3, after flash)
+- **Flash #1 write completed** (`Program flash … done`); verify readback was cut by the user pulling
+  the dongle — harmless (verify is read-only). Board booted the new firmware.
+- **Boot + alive:** `?` → full ADS + LIS3DH register dump + `$$$` (stock pristine SPI driver reads
+  both chips cleanly).
+- **session_start drove it** through `?`/mode/500 Hz/channel-set (all acked) — then **aborts at
+  `TUNE FAIL`**: the minimal firmware has no runtime-tune protocol (by design). ⇒ **session_start.py
+  is NOT compatible with board #3 as-is** (also expects PERSIST + the escape-token stop). FOLLOW-UP:
+  needs a "minimal-firmware" mode (skip TUNE/PERSIST, power-cycle stop) to drive board #3.
+- **%META CONFIRMED** via direct paced driving: SD open `Size 33780 SD file OBCI_BF.TXT` (float fix
+  correct at 500 Hz) → `M` frame → **`META OK 47 3316`** (correct len + checksum) → clean close
+  (`Max write 326 uS, Overruns: 0`). The ported %META feature works end-to-end.
+- 250 Hz `!sdFileOpen` gate: reviewed one-liner, not separately bench-tested here (verified at 500 Hz);
+  confirm in real 250 Hz use.
+- ⚠ Test junk on the card (incl. a big 24 h slot `OBCI_BB` from an early mis-paced test) — reformat
+  the card before real recording if desired.
